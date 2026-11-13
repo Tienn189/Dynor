@@ -121,17 +121,72 @@ workflows:
         if __name__ == "__main__":
             main()
         PY
-    - name: Tạo icon và project Xcode
+    - name: Chuẩn bị Airlift đã xác minh, icon và project Xcode
       script: |
         set -euo pipefail
+        if [ "$(uname -m)" != "arm64" ]; then
+          echo "AirliftFFI simulator tests require the configured Apple Silicon runner." >&2
+          exit 1
+        fi
         xcodebuild -version
         if ! command -v xcodegen >/dev/null 2>&1; then
           brew install xcodegen
         fi
         xcodegen --version
+        python3 "$SOURCE_DIR/scripts/test_prepare_airlift.py"
+        python3 "$SOURCE_DIR/scripts/prepare_airlift.py" --source-root "$SOURCE_DIR"
         python3 "$SOURCE_DIR/scripts/prepare_icons.py" --source-root "$SOURCE_DIR"
         cd "$SOURCE_DIR"
         xcodegen generate --spec project.yml
+    - name: Kiểm thử native trên iPhone Simulator
+      script: |
+        set -euo pipefail
+        mkdir -p "$CM_BUILD_DIR/build/tests"
+        collect_test_results() {
+          result_status=$?
+          trap - EXIT
+          if [ -d "$CM_BUILD_DIR/build/tests/DynorTests.xcresult" ]; then
+            ditto -c -k --keepParent \
+              "$CM_BUILD_DIR/build/tests/DynorTests.xcresult" \
+              "$CM_BUILD_DIR/build/tests/DynorTests.xcresult.zip" || true
+          fi
+          exit "$result_status"
+        }
+        trap collect_test_results EXIT
+        xcrun simctl list devices available --json > "$DYNOR_WORK_DIR/simulators.json"
+        SIMULATOR_ID="$(python3 - "$DYNOR_WORK_DIR/simulators.json" <<'PY'
+        import json
+        from pathlib import Path
+        import re
+        import sys
+
+        devices = json.loads(Path(sys.argv[1]).read_text())["devices"]
+        candidates = []
+        for runtime, entries in devices.items():
+            if ".iOS-" not in runtime:
+                continue
+            version = tuple(int(part) for part in re.findall(r"\d+", runtime.rsplit(".iOS-", 1)[1]))
+            for device in entries:
+                if device.get("isAvailable") and device.get("name", "").startswith("iPhone"):
+                    candidates.append((version, device.get("state") == "Booted", device["udid"]))
+        if not candidates:
+            raise SystemExit("No available iPhone simulator. Install an iOS simulator runtime in Xcode.")
+        print(max(candidates)[2])
+        PY
+        )"
+        cd "$SOURCE_DIR"
+        xcodebuild \
+          -project Dynor.xcodeproj \
+          -scheme Dynor \
+          -configuration Debug \
+          -sdk iphonesimulator \
+          -destination "platform=iOS Simulator,id=$SIMULATOR_ID,arch=arm64" \
+          -destination-timeout 120 \
+          -parallel-testing-enabled NO \
+          -derivedDataPath "$DYNOR_WORK_DIR/TestDerivedData" \
+          -resultBundlePath "$CM_BUILD_DIR/build/tests/DynorTests.xcresult" \
+          CODE_SIGNING_ALLOWED=NO \
+          test 2>&1 | tee "$CM_BUILD_DIR/build/logs/dynor-tests.log"
     - name: Build archive iOS arm64 chưa ký
       script: |
         set -euo pipefail
@@ -185,10 +240,12 @@ workflows:
         subprocess.run(["zip", "-qry", str(ipa), "Payload"], cwd=staging, check=True)
         subprocess.run(["unzip", "-tq", str(ipa)], check=True)
         (artifacts / "README-IPA.txt").write_text(
-            "Dynor native SwiftUI device app, iOS 17+.\n"
+            "Dynor native SwiftUI device app, iOS 18+.\n"
             "Unzip Dynor-IPA.zip in Files to get Dynor-unsigned.ipa.\n"
             "This IPA is unsigned. Sign it with valid Apple signing assets before installation.\n"
-            "This is a development build: Airlift, real login, payments and rewarded ads are not integrated.\n",
+            "Native Airlift pairing and Tendies installation are integrated for supported iOS versions.\n"
+            "Tendies installation requires a valid pairing record and LocalDevVPN. Confirm the wallpaper on the Lock Screen.\n"
+            "This is a development build; real login, payments and rewarded ads are not integrated.\n",
             encoding="utf-8",
         )
         # Expose a generic download ZIP so iPhone browsers do not open the OTA install flow.
@@ -205,3 +262,5 @@ workflows:
     - build/download/Dynor-IPA.zip
     - build/download/README-IPA.txt
     - build/logs/*.log
+    - build/tests/*.xcresult.zip
+
