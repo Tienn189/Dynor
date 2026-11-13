@@ -1,0 +1,197 @@
+# Dynor native SwiftUI → unsigned iPhoneOS IPA. Place this file at the repository root.
+workflows:
+  dynor-ios-unsigned:
+    name: Dynor iOS IPA
+    instance_type: mac_mini_m2
+    max_build_duration: 60
+    environment:
+      xcode: latest
+      vars:
+        SOURCE_ARCHIVE: Dynor-iOS-source.zip
+        HOMEBREW_NO_AUTO_UPDATE: '1'
+    scripts:
+    - name: Giải nén source SwiftUI
+      script: |
+        set -euo pipefail
+        WORK_DIR="$(mktemp -d "${TMPDIR:-/tmp}/dynor-codemagic.XXXXXX")"
+        printf 'DYNOR_WORK_DIR=%s\n' "$WORK_DIR" >> "$CM_ENV"
+        mkdir -p "$CM_BUILD_DIR/build/ipa" "$CM_BUILD_DIR/build/logs"
+        # Self-contained: the repository only needs codemagic.yaml and the source ZIP.
+        python3 - --workspace "$CM_BUILD_DIR" --archive "$SOURCE_ARCHIVE" --destination "$WORK_DIR/source" --env-file "$CM_ENV" <<'PY'
+        #!/usr/bin/env python3
+        """Select native sources from a repository or safely unpack the native source ZIP."""
+        from __future__ import annotations
+
+        import argparse
+        import os
+        from pathlib import Path, PurePosixPath
+        import shutil
+        import stat
+        import zipfile
+
+        MAX_ARCHIVE_BYTES = 250 * 1024 * 1024
+        MAX_EXPANDED_BYTES = 512 * 1024 * 1024
+        MAX_ENTRIES = 10_000
+
+
+        def select_source(workspace: Path, archive_name: str, destination: Path) -> Path:
+            workspace = workspace.resolve()
+            # Prefer checked-in native source so an old ZIP cannot mask later source edits.
+            if (workspace / "project.yml").is_file() and (workspace / "Dynor").is_dir():
+                print("Using native source checked into the repository.")
+                return workspace
+
+            relative = PurePosixPath(archive_name)
+            if not archive_name or relative.is_absolute() or ".." in relative.parts or "\\" in archive_name:
+                raise ValueError("source_archive must be a relative ZIP path inside the repository.")
+            archive = (workspace / archive_name).resolve()
+            if not archive.is_relative_to(workspace) or not archive.is_file():
+                raise ValueError("No native project.yml + Dynor directory or source ZIP was found.")
+            if archive.stat().st_size > MAX_ARCHIVE_BYTES:
+                raise ValueError("Source ZIP exceeds the 250 MiB compressed-size limit.")
+            destination = destination.resolve()
+            if destination == workspace or workspace.is_relative_to(destination):
+                raise ValueError("Extraction destination must be separate from the repository.")
+            destination.mkdir(parents=True, exist_ok=True)
+            if any(destination.iterdir()):
+                raise ValueError("Extraction destination must be empty.")
+
+            with zipfile.ZipFile(archive) as bundle:
+                entries = bundle.infolist()
+                if len(entries) > MAX_ENTRIES:
+                    raise ValueError("Source ZIP contains too many entries.")
+                total = 0
+                seen = set()
+                for entry in entries:
+                    name = entry.filename
+                    part = PurePosixPath(name)
+                    if (not name or part.is_absolute() or ".." in part.parts or "\\" in name
+                            or any(ord(c) < 32 for c in name)
+                            or (part.parts and ":" in part.parts[0])):
+                        raise ValueError("Source ZIP contains an unsafe entry path.")
+                    key = str(part)
+                    if key in seen:
+                        raise ValueError("Source ZIP contains duplicate paths.")
+                    seen.add(key)
+                    mode = entry.external_attr >> 16
+                    kind = stat.S_IFMT(mode)
+                    if stat.S_ISLNK(mode) or kind not in (0, stat.S_IFREG, stat.S_IFDIR):
+                        raise ValueError("Source ZIP symlinks and special files are not supported.")
+                    if entry.flag_bits & 1:
+                        raise ValueError("Encrypted ZIP entries are not supported.")
+                    if not (destination / part).resolve().is_relative_to(destination):
+                        raise ValueError("Source ZIP entry escapes the extraction directory.")
+                    total += entry.file_size
+                    if total > MAX_EXPANDED_BYTES:
+                        raise ValueError("Source ZIP exceeds the 512 MiB expanded-size limit.")
+                # Validate all entries before writing anything; never call extractall on untrusted paths.
+                for entry in entries:
+                    target = destination / PurePosixPath(entry.filename)
+                    if entry.is_dir():
+                        target.mkdir(parents=True, exist_ok=True)
+                    else:
+                        target.parent.mkdir(parents=True, exist_ok=True)
+                        with bundle.open(entry) as incoming, target.open("xb") as outgoing:
+                            shutil.copyfileobj(incoming, outgoing)
+
+            projects = [p.parent for p in destination.rglob("project.yml")
+                        if p.is_file() and (p.parent / "Dynor").is_dir()]
+            if len(projects) != 1:
+                raise ValueError("ZIP must contain exactly one project.yml with a sibling Dynor directory.")
+            print("Extracted native SwiftUI source ZIP.")
+            return projects[0]
+
+
+        def main() -> None:
+            parser = argparse.ArgumentParser(description=__doc__)
+            parser.add_argument("--workspace", type=Path, default=Path(os.environ.get("CM_BUILD_DIR", ".")))
+            parser.add_argument("--archive", default="Dynor-iOS-source.zip")
+            parser.add_argument("--destination", type=Path, required=True)
+            parser.add_argument("--env-file", type=Path)
+            args = parser.parse_args()
+            source = select_source(args.workspace, args.archive, args.destination)
+            if any(c in str(source) for c in "\r\n"):
+                raise ValueError("Source path must not contain line breaks.")
+            print(f"SOURCE_DIR={source}")
+            if args.env_file:
+                with args.env_file.open("a", encoding="utf-8") as output:
+                    output.write(f"SOURCE_DIR={source}\n")
+
+
+        if __name__ == "__main__":
+            main()
+        PY
+    - name: Tạo icon và project Xcode
+      script: |
+        set -euo pipefail
+        xcodebuild -version
+        if ! command -v xcodegen >/dev/null 2>&1; then
+          brew install xcodegen
+        fi
+        xcodegen --version
+        python3 "$SOURCE_DIR/scripts/prepare_icons.py" --source-root "$SOURCE_DIR"
+        cd "$SOURCE_DIR"
+        xcodegen generate --spec project.yml
+    - name: Build archive iOS arm64 chưa ký
+      script: |
+        set -euo pipefail
+        cd "$SOURCE_DIR"
+        xcodebuild \
+          -project Dynor.xcodeproj \
+          -scheme Dynor \
+          -configuration Release \
+          -sdk iphoneos \
+          -destination 'generic/platform=iOS' \
+          -derivedDataPath "$DYNOR_WORK_DIR/DerivedData" \
+          -archivePath "$DYNOR_WORK_DIR/Dynor.xcarchive" \
+          CODE_SIGNING_ALLOWED=NO \
+          CODE_SIGNING_REQUIRED=NO \
+          CODE_SIGN_IDENTITY="" \
+          DEVELOPMENT_TEAM="" \
+          archive 2>&1 | tee "$CM_BUILD_DIR/build/logs/dynor-build.log"
+    - name: Đóng gói IPA
+      script: |
+        set -euo pipefail
+        python3 - <<'PYCODE'
+        import os
+        from pathlib import Path
+        import plistlib
+        import shutil
+        import subprocess
+
+        work = Path(os.environ["DYNOR_WORK_DIR"])
+        artifacts = Path(os.environ["CM_BUILD_DIR"]) / "build/ipa"
+        artifacts.mkdir(parents=True, exist_ok=True)
+        apps = list((work / "Dynor.xcarchive/Products/Applications").glob("*.app"))
+        if len(apps) != 1 or not apps[0].is_dir():
+            raise SystemExit("Archive must contain exactly one native iOS app.")
+        app = apps[0]
+        with (app / "Info.plist").open("rb") as stream:
+            info = plistlib.load(stream)
+        if "iPhoneOS" not in info.get("CFBundleSupportedPlatforms", []):
+            raise SystemExit("Expected an iPhoneOS device app, not a simulator app.")
+        executable = app / info["CFBundleExecutable"]
+        architectures = subprocess.check_output(["lipo", "-archs", str(executable)], text=True).split()
+        if "arm64" not in architectures:
+            raise SystemExit("Native device executable must include arm64.")
+        staging = work / "ipa-staging"
+        payload = staging / "Payload"
+        payload.mkdir(parents=True)
+        shutil.copytree(app, payload / app.name, symlinks=True)
+        ipa = artifacts / "Dynor-unsigned.ipa"
+        if ipa.exists():
+            ipa.unlink()
+        subprocess.run(["zip", "-qry", str(ipa), "Payload"], cwd=staging, check=True)
+        subprocess.run(["unzip", "-tq", str(ipa)], check=True)
+        (artifacts / "README-IPA.txt").write_text(
+            "Dynor native SwiftUI device app, iOS 17+.\n"
+            "This IPA is unsigned. Sign it with valid Apple signing assets before installation.\n"
+            "This is a development build: Airlift, real login, payments and rewarded ads are not integrated.\n",
+            encoding="utf-8",
+        )
+        print(f"Created unsigned device IPA: {ipa}")
+        PYCODE
+    artifacts:
+    - build/ipa/Dynor-unsigned.ipa
+    - build/ipa/README-IPA.txt
+    - build/logs/*.log
