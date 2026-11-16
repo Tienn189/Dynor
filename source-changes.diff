@@ -1,0 +1,2677 @@
+--- a/Dynor-iOS/Dynor/DynorApp.swift
++++ b/Dynor-iOS/Dynor/DynorApp.swift
+@@ -5,6 +5,10 @@
+ struct DynorApp: App {
+     @StateObject private var store = DynorStore()
+     @Environment(\.scenePhase) private var scenePhase
++
++    init() {
++        TendiesInstallWorkspace.removeStale()
++    }
+ 
+     var body: some Scene {
+         WindowGroup {
+--- a/Dynor-iOS/Dynor/Models/DocumentImportService.swift
++++ b/Dynor-iOS/Dynor/Models/DocumentImportService.swift
+@@ -14,7 +14,7 @@
+         case .notAFile: return "Hãy chọn một tệp, không phải thư mục."
+         case .empty: return "Tệp trống hoặc chưa tải được từ iCloud. Hãy tải tệp trong ứng dụng Tệp rồi thử lại."
+         case .tooLarge(let limit): return "Tệp vượt quá giới hạn \(limit / 1024 / 1024) MB."
+-        case .unsupportedWallpaper: return "Chỉ nhập ảnh hoặc tệp có đuôi .tendies."
++        case .unsupportedWallpaper: return "Chỉ nhập ảnh, tệp .tendies hoặc gói mã hóa .dynor."
+         case .invalidImage: return "Không đọc được nội dung ảnh."
+         case .invalidPairing: return "Pairing record phải là tệp plist XML hoặc binary chứa một dictionary không rỗng."
+         }
+@@ -35,6 +35,8 @@
+ enum DocumentImportService {
+     static let pairingExtensions: Set<String> = ["plist", "mobiledevicepairing", "mobilepair"]
+     static let wallpaperLimit = 50 * 1024 * 1024
++    // Header (24), nonce (12) and GCM tag (16) surround at most 50 MiB of Tendies.
++    static let encryptedWallpaperLimit = wallpaperLimit + 52
+     static let pairingLimit = 5 * 1024 * 1024
+ 
+     /// Run away from the main actor: coordination may wait for iCloud to download.
+--- a/Dynor-iOS/Dynor/Models/DynorStore.swift
++++ b/Dynor-iOS/Dynor/Models/DynorStore.swift
+@@ -40,7 +40,10 @@
+ enum ThemeAccent: String, CaseIterable { case white }
+ struct LocalProfile: Codable, Equatable { let id: String; let name: String }
+ enum DynorTab: Hashable { case discover, library, pairing, settings }
+-enum ImportedKind: String, Codable { case image, tendies }
++enum ImportedKind: String, Codable {
++    case image, tendies, encryptedTendies
++    var isTendies: Bool { self == .tendies || self == .encryptedTendies }
++}
+ struct ImportedWallpaper: Codable, Identifiable {
+     let id: UUID
+     let displayName: String
+@@ -184,15 +187,46 @@
+         for url in urls {
+             do {
+                 let staged = try await Task.detached(priority: .userInitiated) {
+-                    try DocumentImportService.stage(url, maximumBytes: DocumentImportService.wallpaperLimit)
++                    try DocumentImportService.stage(url, maximumBytes: DocumentImportService.encryptedWallpaperLimit)
+                 }.value
+                 defer { staged.remove() }
+                 let ext = staged.pathExtension
+-                let isTendies = ext == "tendies"
++                let isEncrypted = ext == "dynor"
++                let isTendies = ext == "tendies" || isEncrypted
+                 guard isTendies || UTType(filenameExtension: ext)?.conforms(to: .image) == true else {
+                     throw DocumentImportError.unsupportedWallpaper
+                 }
+-                if let existing = (library + added).first(where: { $0.displayName == staged.displayName && $0.byteCount == staged.byteCount }) {
++                if !isEncrypted && staged.byteCount > Int64(DocumentImportService.wallpaperLimit) {
++                    throw DocumentImportError.tooLarge(DocumentImportService.wallpaperLimit)
++                }
++                let encryptedHash: String?
++                if isEncrypted {
++                    encryptedHash = try await Task.detached(priority: .userInitiated) {
++                        try EncryptedTendiesEnvelope(contentsOf: staged.url).sha256
++                    }.value
++                } else {
++                    encryptedHash = nil
++                }
++                let candidates = (library + added).filter {
++                    $0.displayName == staged.displayName && $0.byteCount == staged.byteCount
++                }
++                let existing: ImportedWallpaper?
++                if let encryptedHash {
++                    let directory = libraryDirectory
++                    // A fresh encryption has a new package ID/key but usually
++                    // the same filename and length. Reuse only identical bytes,
++                    // never a different or previously revoked encrypted package.
++                    existing = await Task.detached(priority: .userInitiated) {
++                        candidates.first { candidate in
++                            guard candidate.kind == .encryptedTendies else { return false }
++                            let url = directory.appendingPathComponent(candidate.storedFilename)
++                            return (try? EncryptedTendiesEnvelope(contentsOf: url).sha256) == encryptedHash
++                        }
++                    }.value
++                } else {
++                    existing = candidates.first
++                }
++                if let existing {
+                     duplicates += 1
+                     available.append(existing)
+                     continue
+@@ -202,7 +236,8 @@
+                 }
+                 let id = UUID()
+                 let record = ImportedWallpaper(id: id, displayName: staged.displayName,
+-                    storedFilename: id.uuidString + "." + ext, kind: isTendies ? .tendies : .image,
++                    storedFilename: id.uuidString + "." + ext,
++                    kind: isEncrypted ? .encryptedTendies : isTendies ? .tendies : .image,
+                     addedAt: Date(), byteCount: staged.byteCount)
+                 try FileManager.default.copyItem(at: staged.url, to: fileURL(for: record))
+                 added.append(record)
+--- /dev/null
++++ b/Dynor-iOS/Dynor/Services/EncryptedTendiesEnvelope.swift
+@@ -0,0 +1,136 @@
++import Foundation
++import CryptoKit
++
++/// .dynor v1: magic(8) || package UUID(16) || GCM nonce(12) || ciphertext || tag(16).
++/// The first 24 bytes are authenticated; keys are never part of the package.
++struct EncryptedTendiesEnvelope {
++    static let magic = Data("DYNORT01".utf8)
++    static let headerSize = 24
++    static let overhead = headerSize + 12 + 16
++    static let maximumPlaintextBytes = 50 * 1024 * 1024
++    static let maximumFileBytes = maximumPlaintextBytes + overhead
++
++    let packageID: UUID
++    let header: Data
++    let sealedData: Data
++    let sha256: String
++
++    init(data: Data) throws {
++        guard data.count > Self.overhead, data.count <= Self.maximumFileBytes,
++              data.prefix(Self.magic.count) == Self.magic else {
++            throw EncryptedTendiesError.invalidPackage
++        }
++        let uuid = [UInt8](data[8..<Self.headerSize])
++        packageID = UUID(uuid: (uuid[0], uuid[1], uuid[2], uuid[3], uuid[4], uuid[5], uuid[6], uuid[7],
++                                uuid[8], uuid[9], uuid[10], uuid[11], uuid[12], uuid[13], uuid[14], uuid[15]))
++        header = Data(data.prefix(Self.headerSize))
++        sealedData = Data(data.dropFirst(Self.headerSize))
++        sha256 = SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
++    }
++
++    init(contentsOf url: URL) throws {
++        guard url.isFileURL else { throw EncryptedTendiesError.invalidPackage }
++        let handle = try FileHandle(forReadingFrom: url)
++        defer { try? handle.close() }
++        var data = Data()
++        while let chunk = try handle.read(upToCount: 64 * 1024), !chunk.isEmpty {
++            guard data.count + chunk.count <= Self.maximumFileBytes else {
++                throw EncryptedTendiesError.invalidPackage
++            }
++            data.append(chunk)
++        }
++        try self.init(data: data)
++    }
++
++    static func header(for packageID: UUID) -> Data {
++        var uuid = packageID.uuid
++        var data = magic
++        withUnsafeBytes(of: &uuid) { data.append(contentsOf: $0) }
++        return data
++    }
++
++    func decrypt(using key: SymmetricKey) throws -> Data {
++        guard key.bitCount == 256 else { throw EncryptedTendiesError.invalidPackage }
++        let plaintext: Data
++        do {
++            let box = try AES.GCM.SealedBox(combined: sealedData)
++            plaintext = try AES.GCM.open(box, using: key, authenticating: header)
++        } catch {
++            throw EncryptedTendiesError.invalidPackage
++        }
++        guard !plaintext.isEmpty, plaintext.count <= Self.maximumPlaintextBytes,
++              Self.isZIP(plaintext) else { throw EncryptedTendiesError.invalidPackage }
++        // ZIP paths, expansion, CRCs and PosterBoard descriptors are still verified
++        // by TendiesArchiveValidator before any native write.
++        return plaintext
++    }
++
++    private static func isZIP(_ data: Data) -> Bool {
++        data.starts(with: [0x50, 0x4b, 0x03, 0x04]) || data.starts(with: [0x50, 0x4b, 0x05, 0x06])
++    }
++}
++
++enum EncryptedTendiesError: LocalizedError {
++    case invalidPackage
++    case loginRequired
++    case permissionDenied
++    case unavailablePackage
++    case rateLimited
++    case serviceUnavailable
++    case invalidServerResponse
++    case secureEnclaveUnavailable
++    case keyStorage
++
++    var errorDescription: String? {
++        switch self {
++        case .invalidPackage: return "Gói .dynor bị hỏng, bị thay đổi hoặc không đúng định dạng. Hãy tải lại từ nguồn của bạn."
++        case .loginRequired: return "Đăng nhập tài khoản Dynor trong Cài đặt trước khi cài gói mã hóa."
++        case .permissionDenied: return "Tài khoản chưa có quyền mở gói này. Kiểm tra quyền truy cập hoặc VIP của bạn."
++        case .unavailablePackage: return "Gói mã hóa chưa được đăng ký hoặc đã ngừng cấp quyền."
++        case .rateLimited: return "Bạn đã yêu cầu mở gói quá nhiều lần. Hãy chờ một phút rồi thử lại."
++        case .serviceUnavailable: return "Dịch vụ cấp khóa chưa sẵn sàng. Kiểm tra kết nối mạng hoặc liên hệ quản trị Dynor."
++        case .invalidServerResponse: return "Không xác minh được khóa do máy chủ trả về. Đã dừng cài đặt."
++        case .secureEnclaveUnavailable: return "Thiết bị này không hỗ trợ khóa bảo vệ cần thiết để mở gói .dynor."
++        case .keyStorage: return "Không truy cập được khóa bảo vệ trên thiết bị. Hãy mở khóa iPhone rồi thử lại."
++        }
++    }
++}
++
++/// The server wraps a content key for this installation's P-256 recipient key.
++struct EncryptedTendiesKeyResponse: Decodable {
++    let ephemeralPublicKey: String
++    let salt: String
++    let wrappedKey: String
++
++    enum CodingKeys: String, CodingKey {
++        case ephemeralPublicKey = "ephemeral_public_key"
++        case salt
++        case wrappedKey = "wrapped_key"
++    }
++
++    func publicKey() throws -> P256.KeyAgreement.PublicKey {
++        guard let data = Data(base64Encoded: ephemeralPublicKey), data.count == 65, data.first == 4 else {
++            throw EncryptedTendiesError.invalidServerResponse
++        }
++        do { return try P256.KeyAgreement.PublicKey(x963Representation: data) }
++        catch { throw EncryptedTendiesError.invalidServerResponse }
++    }
++
++    func unwrap(sharedSecret: SharedSecret, header: Data) throws -> SymmetricKey {
++        guard header.count == EncryptedTendiesEnvelope.headerSize,
++              let saltData = Data(base64Encoded: salt), saltData.count == 16,
++              let wrappedData = Data(base64Encoded: wrappedKey), wrappedData.count == 60 else {
++            throw EncryptedTendiesError.invalidServerResponse
++        }
++        let wrappingKey = sharedSecret.hkdfDerivedSymmetricKey(
++            using: SHA256.self, salt: saltData, sharedInfo: Data("DynorContentKey/v1".utf8), outputByteCount: 32)
++        var keyBytes: Data
++        do {
++            keyBytes = try AES.GCM.open(AES.GCM.SealedBox(combined: wrappedData),
++                                       using: wrappingKey, authenticating: header)
++        } catch { throw EncryptedTendiesError.invalidServerResponse }
++        defer { keyBytes.resetBytes(in: 0..<keyBytes.count) }
++        guard keyBytes.count == 32 else { throw EncryptedTendiesError.invalidServerResponse }
++        return SymmetricKey(data: keyBytes)
++    }
++}
+--- /dev/null
++++ b/Dynor-iOS/Dynor/Services/EncryptedTendiesService.swift
+@@ -0,0 +1,185 @@
++import Foundation
++import CryptoKit
++import Security
++
++struct PreparedEncryptedTendies {
++    let url: URL
++    let directory: URL
++    func remove() { try? FileManager.default.removeItem(at: directory) }
++}
++
++/// Private, backup-excluded working directories. No decrypted archive is placed
++/// in Documents, the library, Photos, a share sheet or an export provider.
++enum TendiesInstallWorkspace {
++    static var root: URL {
++        FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
++            .appendingPathComponent("Dynor/InstallStaging", isDirectory: true)
++    }
++
++    static func create() throws -> URL {
++        let manager = FileManager.default
++        try manager.createDirectory(at: root, withIntermediateDirectories: true,
++                                    attributes: [.posixPermissions: 0o700, .protectionKey: FileProtectionType.complete])
++        var values = URLResourceValues()
++        values.isExcludedFromBackup = true
++        var protectedRoot = root
++        try protectedRoot.setResourceValues(values)
++        let directory = root.appendingPathComponent(UUID().uuidString, isDirectory: true)
++        try manager.createDirectory(at: directory, withIntermediateDirectories: false,
++                                    attributes: [.posixPermissions: 0o700, .protectionKey: FileProtectionType.complete])
++        return directory
++    }
++
++    /// Called once at process launch, before an installation can begin. A crash
++    /// can skip defer; remove its private working files on the next launch.
++    static func removeStale() {
++        try? FileManager.default.removeItem(at: root)
++        let temporary = FileManager.default.temporaryDirectory
++        if let files = try? FileManager.default.contentsOfDirectory(at: temporary, includingPropertiesForKeys: nil) {
++            for file in files where file.lastPathComponent.hasPrefix("dynor-install-") {
++                try? FileManager.default.removeItem(at: file)
++            }
++        }
++    }
++}
++
++private final class PackageKeySessionDelegate: NSObject, URLSessionTaskDelegate {
++    func urlSession(_ session: URLSession, task: URLSessionTask,
++                    willPerformHTTPRedirection response: HTTPURLResponse, newRequest request: URLRequest,
++                    completionHandler: @escaping (URLRequest?) -> Void) {
++        // Never forward a key-release request or account token to a redirect.
++        completionHandler(nil)
++    }
++}
++
++actor EncryptedTendiesService {
++    static let shared = EncryptedTendiesService()
++    private let base = URL(string: "https://wkivekbodwbinmvargts.supabase.co")!
++    // Supabase's publishable key identifies the project; it is not a content key.
++    private let publishableKey = "sb_publishable_7eP5C7X8t6ip2ntFANmGJQ_K1Mybu2m"
++    private let markerKey = "dynor.package-recipient.install-id.v1"
++    private let keyService = "com.dynor.package-recipient.v1"
++
++    func prepareForInstallation(_ source: URL) async throws -> PreparedEncryptedTendies {
++        let envelope = try EncryptedTendiesEnvelope(contentsOf: source)
++        try Task.checkCancellation()
++        guard let token = await DynorAccountService.shared.galleryAccessToken() else {
++            throw EncryptedTendiesError.loginRequired
++        }
++        let privateKey = try recipientKey()
++        let response = try await fetchKey(envelope: envelope, token: token,
++                                          publicKey: privateKey.publicKey.x963Representation)
++        try Task.checkCancellation()
++        let serverKey = try response.publicKey()
++        let sharedSecret: SharedSecret
++        do { sharedSecret = try privateKey.sharedSecretFromKeyAgreement(with: serverKey) }
++        catch { throw EncryptedTendiesError.invalidServerResponse }
++        let key = try response.unwrap(sharedSecret: sharedSecret, header: envelope.header)
++        var plaintext = try envelope.decrypt(using: key)
++        defer { plaintext.resetBytes(in: 0..<plaintext.count) }
++        try Task.checkCancellation()
++        let directory = try TendiesInstallWorkspace.create()
++        do {
++            let output = directory.appendingPathComponent("source.tendies")
++            try plaintext.write(to: output, options: [.atomic, .completeFileProtection])
++            try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: output.path)
++            try Task.checkCancellation()
++            return PreparedEncryptedTendies(url: output, directory: directory)
++        } catch {
++            try? FileManager.default.removeItem(at: directory)
++            throw error
++        }
++    }
++
++    private func fetchKey(envelope: EncryptedTendiesEnvelope, token: String, publicKey: Data) async throws -> EncryptedTendiesKeyResponse {
++        var request = URLRequest(url: base.appendingPathComponent("functions/v1/dynor-package-key"))
++        request.httpMethod = "POST"
++        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
++        request.setValue("no-store", forHTTPHeaderField: "Cache-Control")
++        request.setValue(publishableKey, forHTTPHeaderField: "apikey")
++        request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
++        request.httpBody = try JSONSerialization.data(withJSONObject: [
++            "package_id": envelope.packageID.uuidString.lowercased(),
++            "sha256": envelope.sha256,
++            "public_key": publicKey.base64EncodedString()
++        ])
++        let configuration = URLSessionConfiguration.ephemeral
++        configuration.urlCache = nil
++        configuration.httpCookieStorage = nil
++        configuration.httpShouldSetCookies = false
++        configuration.requestCachePolicy = .reloadIgnoringLocalCacheData
++        configuration.timeoutIntervalForRequest = 30
++        configuration.timeoutIntervalForResource = 60
++        let session = URLSession(configuration: configuration, delegate: PackageKeySessionDelegate(), delegateQueue: nil)
++        defer { session.invalidateAndCancel() }
++        let (bytes, response) = try await session.bytes(for: request)
++        guard let http = response as? HTTPURLResponse else { throw EncryptedTendiesError.serviceUnavailable }
++        switch http.statusCode {
++        case 200: break
++        case 401: throw EncryptedTendiesError.loginRequired
++        case 403: throw EncryptedTendiesError.permissionDenied
++        case 404: throw EncryptedTendiesError.unavailablePackage
++        case 409: throw EncryptedTendiesError.invalidPackage
++        case 429: throw EncryptedTendiesError.rateLimited
++        default: throw EncryptedTendiesError.serviceUnavailable
++        }
++        var data = Data()
++        for try await byte in bytes {
++            guard data.count < 8192 else { throw EncryptedTendiesError.invalidServerResponse }
++            data.append(byte)
++        }
++        do { return try JSONDecoder().decode(EncryptedTendiesKeyResponse.self, from: data) }
++        catch { throw EncryptedTendiesError.invalidServerResponse }
++    }
++
++    private func recipientKey() throws -> SecureEnclave.P256.KeyAgreement.PrivateKey {
++        guard SecureEnclave.isAvailable else { throw EncryptedTendiesError.secureEnclaveUnavailable }
++        // Keychain items survive uninstall. An installation marker in app defaults
++        // prevents reusing another installation's recipient key after reinstall.
++        if let marker = UserDefaults.standard.string(forKey: markerKey) {
++            var query = keyQuery(account: marker)
++            query[kSecReturnData as String] = true
++            query[kSecMatchLimit as String] = kSecMatchLimitOne
++            var result: CFTypeRef?
++            let status = SecItemCopyMatching(query as CFDictionary, &result)
++            if status == errSecSuccess, let data = result as? Data {
++                do { return try SecureEnclave.P256.KeyAgreement.PrivateKey(dataRepresentation: data) }
++                catch { throw EncryptedTendiesError.keyStorage }
++            }
++            guard status == errSecItemNotFound else { throw EncryptedTendiesError.keyStorage }
++        }
++        var accessError: Unmanaged<CFError>?
++        guard let accessControl = SecAccessControlCreateWithFlags(
++            nil, kSecAttrAccessibleWhenUnlockedThisDeviceOnly, .privateKeyUsage, &accessError) else {
++            throw EncryptedTendiesError.keyStorage
++        }
++        let key: SecureEnclave.P256.KeyAgreement.PrivateKey
++        do { key = try SecureEnclave.P256.KeyAgreement.PrivateKey(accessControl: accessControl) }
++        catch { throw EncryptedTendiesError.keyStorage }
++        let oldKeys: [String: Any] = [
++            kSecClass as String: kSecClassGenericPassword,
++            kSecAttrService as String: keyService,
++            kSecAttrSynchronizable as String: false
++        ]
++        let removalStatus = SecItemDelete(oldKeys as CFDictionary)
++        guard removalStatus == errSecSuccess || removalStatus == errSecItemNotFound else {
++            throw EncryptedTendiesError.keyStorage
++        }
++        let marker = UUID().uuidString
++        var query = keyQuery(account: marker)
++        query[kSecAttrAccessible as String] = kSecAttrAccessibleWhenUnlockedThisDeviceOnly
++        query[kSecValueData as String] = key.dataRepresentation
++        guard SecItemAdd(query as CFDictionary, nil) == errSecSuccess else {
++            throw EncryptedTendiesError.keyStorage
++        }
++        UserDefaults.standard.set(marker, forKey: markerKey)
++        return key
++    }
++
++    private func keyQuery(account: String) -> [String: Any] {
++        [kSecClass as String: kSecClassGenericPassword,
++         kSecAttrService as String: keyService,
++         kSecAttrAccount as String: account,
++         kSecAttrSynchronizable as String: false]
++    }
++}
+--- a/Dynor-iOS/Dynor/Services/TendiesCompatibility.swift
++++ b/Dynor-iOS/Dynor/Services/TendiesCompatibility.swift
+@@ -38,7 +38,7 @@
+         let requiresBetaConfirmation = version.majorVersion == 27 && version.minorVersion == 2
+         let warning: String?
+         if version.majorVersion < 18 {
+-            warning = "Cài Tendies bằng Airlift yêu cầu iOS 18 trở lên. Bạn vẫn có thể nhập và chia sẻ tệp."
++            warning = "Cài Tendies bằng Airlift yêu cầu iOS 18 trở lên. Bạn vẫn có thể nhập tệp vào Thư viện."
+         } else if version.majorVersion > 27 || (version.majorVersion == 27 && version.minorVersion > 2) {
+             warning = "Phiên bản này nằm ngoài phạm vi AirCard hỗ trợ. Airlift đã bị vá từ iOS 27.2 beta 3 nên Dynor không thực hiện cài Tendies."
+         } else if requiresBetaConfirmation {
+--- a/Dynor-iOS/Dynor/Services/TendiesInstaller.swift
++++ b/Dynor-iOS/Dynor/Services/TendiesInstaller.swift
+@@ -45,11 +45,19 @@
+         }
+         installing = true
+         defer { installing = false }
++        var decrypted: PreparedEncryptedTendies?
++        if archiveURL.pathExtension.lowercased() == "dynor" {
++            log("Đang xác minh quyền và mở gói mã hóa…")
++            decrypted = try await EncryptedTendiesService.shared.prepareForInstallation(archiveURL)
++        }
++        defer { decrypted?.remove() }
++        let installArchive = decrypted?.url ?? archiveURL
++        try Task.checkCancellation()
+         return try await withCheckedThrowingContinuation { continuation in
+             Self.queue.async {
+                 do {
+                     continuation.resume(returning: try Self.performInstall(
+-                        archiveURL: archiveURL, pairingURL: pairingURL, log: log, progress: progress))
++                        archiveURL: installArchive, pairingURL: pairingURL, log: log, progress: progress))
+                 } catch { continuation.resume(throwing: error) }
+             }
+         }
+@@ -64,13 +72,13 @@
+         log("Hệ thống: \(ProcessInfo.processInfo.operatingSystemVersionString)")
+         log("Đang kiểm tra tệp Tendies…")
+         progress(0.02)
+-        let work = FileManager.default.temporaryDirectory.appendingPathComponent("dynor-install-" + UUID().uuidString, isDirectory: true)
+-        try FileManager.default.createDirectory(at: work, withIntermediateDirectories: true)
++        let work = try TendiesInstallWorkspace.create()
+         defer { try? FileManager.default.removeItem(at: work) }
+         // Snapshot both inputs: another open-in/import action may replace active pairing.
+         let stagedArchive = work.appendingPathComponent("source.tendies")
+         let stagedPairing = work.appendingPathComponent("pairing.plist")
+         try FileManager.default.copyItem(at: archiveURL, to: stagedArchive)
++        try FileManager.default.setAttributes([.protectionKey: FileProtectionType.complete, .posixPermissions: 0o600], ofItemAtPath: stagedArchive.path)
+         try FileManager.default.copyItem(at: pairingURL, to: stagedPairing)
+         try FileManager.default.setAttributes([.protectionKey: FileProtectionType.complete], ofItemAtPath: stagedPairing.path)
+         let entries = try TendiesArchiveValidator.validateBeforeExtraction(at: stagedArchive)
+--- a/Dynor-iOS/Dynor/Views/LibraryView.swift
++++ b/Dynor-iOS/Dynor/Views/LibraryView.swift
+@@ -16,7 +16,7 @@
+     @State private var category = "Tất cả"
+     private let columns = [GridItem(.flexible(), spacing: 14), GridItem(.flexible(), spacing: 14)]
+     private var visible: [ImportedWallpaper] {
+-        store.library.filter { category == "Tất cả" || ($0.kind == .tendies ? category == "Tendies" : category == "Ảnh") }
++        store.library.filter { category == "Tất cả" || ($0.kind.isTendies ? category == "Tendies" : category == "Ảnh") }
+     }
+ 
+     var body: some View {
+@@ -27,7 +27,7 @@
+                     Text("Thư viện của tôi").font(.largeTitle.bold())
+                     Text("Ảnh và Tendies của bạn, lưu ngay trên iPhone.").font(.subheadline).foregroundStyle(.secondary)
+                 }
+-                Label("Chọn nhiều ảnh hoặc tệp .tendies. Mỗi tệp tối đa 50 MB. File gốc của bạn không bị thay đổi.", systemImage: "lock.shield")
++                Label("Chọn ảnh, tệp .tendies hoặc gói mã hóa .dynor. Nội dung mỗi tệp tối đa 50 MB. File gốc của bạn không bị thay đổi.", systemImage: "lock.shield")
+                     .font(.caption).foregroundStyle(.secondary).padding(16)
+                     .frame(maxWidth: .infinity, alignment: .leading)
+                     .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 18))
+@@ -51,7 +51,7 @@
+                     ContentUnavailableView {
+                         Label("Bộ sưu tập bắt đầu từ bạn", systemImage: "square.and.arrow.down")
+                     } description: {
+-                        Text("Nhập ảnh hoặc tệp Tendies từ ứng dụng Tệp. Sau khi nhập, mở tệp Tendies để cài hình nền bằng Airlift.")
++                        Text("Nhập ảnh, tệp .tendies hoặc gói mã hóa .dynor từ ứng dụng Tệp. Sau khi nhập, mở gói để cài hình nền.")
+                     } actions: {
+                         Button("Nhập ảnh / Tendies", action: showImportPicker)
+                             .buttonStyle(.borderedProminent)
+@@ -77,7 +77,7 @@
+                                         }
+                                     }
+                                     Text(item.displayName).font(.caption.weight(.medium)).lineLimit(1).foregroundStyle(.primary)
+-                                    Text(item.kind == .tendies ? "Tendies · Cài hình nền" : ByteCountFormatter.string(fromByteCount: item.byteCount, countStyle: .file))
++                                    Text(item.kind == .encryptedTendies ? "Dynor · Gói mã hóa" : item.kind.isTendies ? "Tendies · Cài hình nền" : ByteCountFormatter.string(fromByteCount: item.byteCount, countStyle: .file))
+                                         .font(.caption2).foregroundStyle(.secondary)
+                                 }
+                             }.buttonStyle(.plain).disabled(readingFiles)
+@@ -166,7 +166,7 @@
+         guard !pickerIsVisible, !importing, !readingFiles,
+               store.selectedTab == .library, let id = store.pendingLibraryPreview,
+               let item = store.library.first(where: { $0.id == id }) else { return }
+-        category = item.kind == .tendies ? "Tendies" : "Ảnh"
++        category = item.kind.isTendies ? "Tendies" : "Ảnh"
+         selecting = false
+         selected.removeAll()
+         preview = item
+@@ -185,8 +185,8 @@
+                 ZStack {
+                     LinearGradient(colors: [.init(red: 0.35, green: 0.48, blue: 0.43), .init(red: 0.7, green: 0.7, blue: 0.46)], startPoint: .topLeading, endPoint: .bottomTrailing)
+                     VStack(spacing: 20) {
+-                        Image(systemName: "square.3.layers.3d").font(.system(size: 42, weight: .ultraLight))
+-                        Text("TENDIES").font(.caption.weight(.medium)).tracking(4)
++                        Image(systemName: item.kind == .encryptedTendies ? "lock.shield" : "square.3.layers.3d").font(.system(size: 42, weight: .ultraLight))
++                        Text(item.kind == .encryptedTendies ? "DYNOR" : "TENDIES").font(.caption.weight(.medium)).tracking(4)
+                     }.foregroundStyle(.white)
+                 }
+             }
+@@ -221,9 +221,13 @@
+                 VStack(alignment: .leading, spacing: 18) {
+                     LibraryArtwork(item: item).frame(height: 400).clipped().clipShape(RoundedRectangle(cornerRadius: 24))
+                     Text(item.displayName).font(.title2.bold())
+-                    Text(item.kind == .tendies ? "Bật LocalDevVPN và mở khóa iPhone trước khi cài. Sau khi cài, nhấn giữ màn hình khóa → Thêm hình nền để chọn hình nền mới." : "Lưu ảnh vào Ảnh, sau đó chọn Chia sẻ → Dùng làm hình nền.")
++                    Text(item.kind.isTendies ? "Bật LocalDevVPN và mở khóa iPhone trước khi cài. Sau khi cài, nhấn giữ màn hình khóa → Thêm hình nền để chọn hình nền mới." : "Lưu ảnh vào Ảnh, sau đó chọn Chia sẻ → Dùng làm hình nền.")
+                         .font(.subheadline).foregroundStyle(.secondary)
+-                    if item.kind == .tendies {
++                    if item.kind == .encryptedTendies {
++                        Label("Đăng nhập Dynor và kết nối Internet mỗi lần cài gói mã hóa. Gói VIP cần tài khoản VIP còn hiệu lực. Dynor không xuất tệp đã giải mã.", systemImage: "lock.shield")
++                            .font(.caption).foregroundStyle(.secondary)
++                    }
++                    if item.kind.isTendies {
+                         tendiesControls
+                     }
+                     if item.kind == .image {
+@@ -239,10 +243,10 @@
+                             Label(saving ? "Đang lưu…" : "Lưu vào Ảnh", systemImage: "photo.badge.arrow.down")
+                                 .frame(maxWidth: .infinity).padding(8)
+                         }.buttonStyle(.borderedProminent).disabled(saving)
+-                    }
+-                    ShareLink(item: store.fileURL(for: item)) {
+-                        Label("Chia sẻ tệp gốc", systemImage: "square.and.arrow.up").frame(maxWidth: .infinity).padding(8)
+-                    }.buttonStyle(.bordered).disabled(installing)
++                        ShareLink(item: store.fileURL(for: item)) {
++                            Label("Chia sẻ ảnh gốc", systemImage: "square.and.arrow.up").frame(maxWidth: .infinity).padding(8)
++                        }.buttonStyle(.bordered).disabled(installing)
++                    }
+                 }.padding(20)
+             }.toolbar { ToolbarItem(placement: .topBarTrailing) { Button("Đóng") { dismiss() }.disabled(installing) } }
+             .interactiveDismissDisabled(installing)
+--- a/Dynor-iOS/Dynor/Views/OnlineGalleryView.swift
++++ b/Dynor-iOS/Dynor/Views/OnlineGalleryView.swift
+@@ -1,7 +1,5 @@
+ import SwiftUI
+ import AVKit
+-import UIKit
+-import UniformTypeIdentifiers
+ 
+ private enum OnlineConfig {
+     static let base = URL(string: "https://wkivekbodwbinmvargts.supabase.co")!
+@@ -207,7 +205,6 @@
+     @State private var showVideo = false
+     @State private var downloading = false
+     @State private var importedWallpaper: ImportedWallpaper?
+-    @State private var sharedURL: URL?
+     @State private var notice: String?
+     var body: some View {
+         NavigationStack {
+@@ -240,20 +237,14 @@
+                         Task {
+                             do {
+                                 let downloadedURL = try await model.download(item)
+-                                let ext = downloadedURL.pathExtension.lowercased()
+-                                if ext == "tendies" || UTType(filenameExtension: ext)?.conforms(to: .image) == true {
+-                                    defer { try? FileManager.default.removeItem(at: downloadedURL.deletingLastPathComponent()) }
+-                                    let imported = await store.importWallpapers(urls: [downloadedURL])
+-                                    if let wallpaper = imported.first {
+-                                        store.message = nil
+-                                        importedWallpaper = wallpaper
+-                                    } else {
+-                                        notice = store.message ?? "Chưa nhập được hình nền đã tải."
+-                                        store.message = nil
+-                                    }
++                                defer { try? FileManager.default.removeItem(at: downloadedURL.deletingLastPathComponent()) }
++                                let imported = await store.importWallpapers(urls: [downloadedURL])
++                                if let wallpaper = imported.first {
++                                    store.message = nil
++                                    importedWallpaper = wallpaper
+                                 } else {
+-                                    // Other catalog attachments retain their export flow.
+-                                    sharedURL = downloadedURL
++                                    notice = store.message ?? "Chưa nhập được hình nền đã tải."
++                                    store.message = nil
+                                 }
+                             } catch { notice = error.localizedDescription }
+                             downloading = false
+@@ -262,7 +253,7 @@
+                         HStack { if downloading { ProgressView() } else { Image(systemName:"arrow.down.circle") }; Text(downloading ? "Đang tải và nhập..." : "Tải và mở trong Dynor") }
+                             .frame(maxWidth:.infinity).padding(15)
+                     }.buttonStyle(.borderedProminent).disabled(downloading)
+-                    Text("Ảnh và gói Tendies được thêm vào Thư viện rồi mở trong Dynor. Với gói Tendies, chọn Cài hình nền ở màn hình tiếp theo. Các định dạng khác mở bảng chia sẻ. Nội dung VIP cần tài khoản VIP còn hiệu lực.")
++                    Text("Ảnh, tệp .tendies và gói mã hóa .dynor được thêm vào Thư viện rồi mở trong Dynor. Với gói hình nền, chọn Cài hình nền ở màn hình tiếp theo. Gói mã hóa cần đăng nhập và Internet mỗi lần cài. Nội dung VIP cần tài khoản VIP còn hiệu lực.")
+                         .font(.caption).foregroundStyle(.secondary)
+                 }.padding(18)
+             }
+@@ -275,14 +266,6 @@
+             .sheet(item: $importedWallpaper) { wallpaper in
+                 LibraryPreview(item: wallpaper).environmentObject(store)
+             }
+-            .sheet(item: Binding(get: { sharedURL.map { SharedFile(url: $0) } }, set: { file in
+-                if file == nil, let url = sharedURL {
+-                    try? FileManager.default.removeItem(at: url.deletingLastPathComponent())
+-                }
+-                sharedURL = file?.url
+-            })) { file in
+-                OnlineShareSheet(url: file.url)
+-            }
+             .onChange(of: store.selectedTab) { _, tab in
+                 if tab != .discover { dismiss() }
+             }
+@@ -291,14 +274,6 @@
+             } message: { Text(notice ?? "") }
+         }
+     }
+-}
+-private struct SharedFile: Identifiable { let url: URL; var id: String { url.path } }
+-private struct OnlineShareSheet: UIViewControllerRepresentable {
+-    let url: URL
+-    func makeUIViewController(context: Context) -> UIActivityViewController {
+-        UIActivityViewController(activityItems: [url], applicationActivities: nil)
+-    }
+-    func updateUIViewController(_ controller: UIActivityViewController, context: Context) {}
+ }
+ private struct OnlineVideoView: View {
+     let url: URL
+--- a/Dynor-iOS/Dynor/Views/PairingView.swift
++++ b/Dynor-iOS/Dynor/Views/PairingView.swift
+@@ -107,7 +107,7 @@
+                             PairingStep(number: "2", title: "Mở Thư viện", detail: "Nhập file .tendies, chọn hình nền rồi bấm Cài hình nền. Giữ ứng dụng mở đến khi quá trình hoàn tất.")
+                             Divider()
+                             PairingDetailRow(title: "Pairing record", value: store.pairingRecord == nil ? "Chưa có" : "Đã lưu cục bộ")
+-                            PairingDetailRow(title: "Thư viện Tendies", value: "\(store.library.filter { $0.kind == .tendies }.count) tệp")
++                            PairingDetailRow(title: "Thư viện Tendies", value: "\(store.library.filter { $0.kind.isTendies }.count) tệp")
+                             Text(TendiesCompatibility.summary + "\n" + TendiesCompatibility.current.detail)
+                                 .font(.caption).foregroundStyle(.secondary)
+                             Link(destination: URL(string: "https://github.com/Mak5er/AirCard-iOS")!) {
+--- a/Dynor-iOS/Dynor/Views/WallpaperDocumentPicker.swift
++++ b/Dynor-iOS/Dynor/Views/WallpaperDocumentPicker.swift
+@@ -10,8 +10,11 @@
+     static var pickerTypes: [UTType] {
+         let tendiesTypes = [
+             UTType(exportedAs: "com.dynor.tendies", conformingTo: .zip),
+-            UTType(importedAs: "com.aircard.tendies", conformingTo: .zip)
+-        ] + UTType.types(tag: "tendies", tagClass: .filenameExtension, conformingTo: nil)
++            UTType(importedAs: "com.aircard.tendies", conformingTo: .zip),
++            UTType(exportedAs: "com.dynor.encrypted-tendies", conformingTo: .data)
++        ] + ["tendies", "dynor"].flatMap {
++            UTType.types(tag: $0, tagClass: .filenameExtension, conformingTo: nil)
++        }
+         var seen = Set<String>()
+         return (tendiesTypes + [.archive, .zip, .image, .data, .item]).filter {
+             seen.insert($0.identifier).inserted
+--- /dev/null
++++ b/Dynor-iOS/DynorTests/EncryptedTendiesTests.swift
+@@ -0,0 +1,111 @@
++import Foundation
++import CryptoKit
++import XCTest
++@testable import Dynor
++
++final class EncryptedTendiesTests: XCTestCase {
++    // TEST ONLY: independent deterministic Node/OpenSSL vector. These published
++    // bytes are never used by the encryptor or the app for real content.
++    private let packageID = UUID(uuidString: "01234567-89ab-4cde-8fab-0123456789ab")!
++    private let testKeyBase64 = "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8="
++    private let expectedPlaintextBase64 = "UEsDBBQAAAAAAAAAIVxJhs0EHgAAAB4AAAALAAAAZml4dHVyZS50eHREeW5vciBUZW5kaWVzIGludGVyb3AgZml4dHVyZQpQSwECFAMUAAAAAAAAACFcSYbNBB4AAAAeAAAACwAAAAAAAAAAAAAAgAEAAAAAZml4dHVyZS50eHRQSwUGAAAAAAEAAQA5AAAARwAAAAAA"
++    private let encryptedBase64 = "RFlOT1JUMDEBI0VniatM3o+rASNFZ4mroKGio6SlpqeoqaqrtlN/KVHLAr9iZYfTJiaJWL2oRxCSt1xsnA4thn+rE2iqAjKNygwnRSvYfaZmCKOtInUiIQejOhcvKm4sywCl1t3E8RpCwO6wv+P9DIzazLrNC6ukxeDFM2i4OoSxmk2Kj4QroAOuj5ue2wZQhYjtqCVQYa7eU/JEW7qswZohijmVWrV500KAFzZZ/4srSpHWz9mta77QpSTOvX8mPa0JPRa160woZw=="
++
++    func testWebCryptoOpenSSLPackageDecryptsWithExpectedHeaderAndHash() throws {
++        let bytes = try XCTUnwrap(Data(base64Encoded: encryptedBase64))
++        let envelope = try EncryptedTendiesEnvelope(data: bytes)
++        XCTAssertEqual(envelope.packageID, packageID)
++        XCTAssertEqual(envelope.header, EncryptedTendiesEnvelope.header(for: packageID))
++        XCTAssertEqual(envelope.header.map { String(format: "%02x", $0) }.joined(),
++                       "44594e4f525430310123456789ab4cde8fab0123456789ab")
++        XCTAssertEqual(envelope.sha256, "b343a42fdd55d7b175caeef9b0485db8ca992954df4626c0d0f533ac3a202844")
++        let key = SymmetricKey(data: try XCTUnwrap(Data(base64Encoded: testKeyBase64)))
++        XCTAssertEqual(try envelope.decrypt(using: key), try XCTUnwrap(Data(base64Encoded: expectedPlaintextBase64)))
++    }
++
++    func testHeaderCiphertextAndTagTamperingAreRejected() throws {
++        let original = try XCTUnwrap(Data(base64Encoded: encryptedBase64))
++        let key = SymmetricKey(data: try XCTUnwrap(Data(base64Encoded: testKeyBase64)))
++        for index in [8, 24, 40, original.count - 1] {
++            var damaged = original
++            damaged[index] ^= 1
++            let envelope = try EncryptedTendiesEnvelope(data: damaged)
++            XCTAssertThrowsError(try envelope.decrypt(using: key), "tampered byte \(index)")
++        }
++        let envelope = try EncryptedTendiesEnvelope(data: original)
++        XCTAssertThrowsError(try envelope.decrypt(using: SymmetricKey(size: .bits256)))
++        XCTAssertThrowsError(try envelope.decrypt(using: SymmetricKey(size: .bits128)))
++    }
++
++    func testMalformedHeaderEmptyBodyAndSizeLimitAreRejected() throws {
++        let valid = try XCTUnwrap(Data(base64Encoded: encryptedBase64))
++        for count in [0, 7, 23, 24, EncryptedTendiesEnvelope.overhead] {
++            XCTAssertThrowsError(try EncryptedTendiesEnvelope(data: Data(valid.prefix(count))))
++        }
++        var wrongMagic = valid
++        wrongMagic[0] ^= 1
++        XCTAssertThrowsError(try EncryptedTendiesEnvelope(data: wrongMagic))
++        XCTAssertThrowsError(try EncryptedTendiesEnvelope(data: Data(count: EncryptedTendiesEnvelope.maximumFileBytes + 1)))
++    }
++
++    func testAuthenticatedNonZIPContentStillRejected() throws {
++        let header = EncryptedTendiesEnvelope.header(for: packageID)
++        let key = SymmetricKey(size: .bits256)
++        let box = try AES.GCM.seal(Data("not a wallpaper archive".utf8), using: key, authenticating: header)
++        let package = header + (try XCTUnwrap(box.combined))
++        let envelope = try EncryptedTendiesEnvelope(data: package)
++        XCTAssertThrowsError(try envelope.decrypt(using: key))
++    }
++
++    func testRecipientKeyWrappingAuthenticatesPackageAndRecipient() throws {
++        // TEST ONLY: scalar 1 and scalar 2, HKDF and AES-GCM calculated
++        // independently with Node/OpenSSL, rather than CryptoKit's seal path.
++        let privateBytes = try XCTUnwrap(Data(base64Encoded:
++            "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAE="))
++        let recipient = try P256.KeyAgreement.PrivateKey(rawRepresentation: privateBytes)
++        let header = EncryptedTendiesEnvelope.header(for: packageID)
++        let contentKey = try XCTUnwrap(Data(base64Encoded: testKeyBase64))
++        let response = EncryptedTendiesKeyResponse(
++            ephemeralPublicKey: "BHzyexiNA09+ilI4AwS1GsPAiWnid/IbNaYLSPxHZpl4B3dVENuO0EApPZrGn3Qw27p9reY86YIpngS3nSJ4c9E=",
++            salt: "PDw8PDw8PDw8PDw8PDw8PA==",
++            wrappedKey: "QEFCQ0RFRkdISUpLben2YLqV74X8DHyPoP5grchhaGCXiu+RmZQwmD70WipGQV++4ZucRdMJeJMwo8yn")
++        let recipientSecret = try recipient.sharedSecretFromKeyAgreement(with: response.publicKey())
++        let result = try response.unwrap(sharedSecret: recipientSecret, header: header)
++        XCTAssertEqual(result.withUnsafeBytes { Data($0) }, contentKey)
++        XCTAssertThrowsError(try response.unwrap(sharedSecret: recipientSecret,
++            header: EncryptedTendiesEnvelope.header(for: UUID())))
++        let otherRecipient = P256.KeyAgreement.PrivateKey()
++        let wrongSecret = try otherRecipient.sharedSecretFromKeyAgreement(with: response.publicKey())
++        XCTAssertThrowsError(try response.unwrap(sharedSecret: wrongSecret, header: header))
++    }
++
++    func testMalformedRecipientKeyResponseIsRejected() throws {
++        let secret = try P256.KeyAgreement.PrivateKey().sharedSecretFromKeyAgreement(with: P256.KeyAgreement.PrivateKey().publicKey)
++        let response = EncryptedTendiesKeyResponse(ephemeralPublicKey: Data(repeating: 0, count: 65).base64EncodedString(),
++                                                  salt: "not base64", wrappedKey: "")
++        XCTAssertThrowsError(try response.publicKey())
++        XCTAssertThrowsError(try response.unwrap(sharedSecret: secret,
++            header: EncryptedTendiesEnvelope.header(for: packageID)))
++    }
++
++    func testCiphertextFileReadDoesNotProduceADecryptedLibraryCopy() throws {
++        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
++        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
++        defer { try? FileManager.default.removeItem(at: root) }
++        let source = root.appendingPathComponent("wallpaper.dynor")
++        let original = try XCTUnwrap(Data(base64Encoded: encryptedBase64))
++        try original.write(to: source)
++        let envelope = try EncryptedTendiesEnvelope(contentsOf: source)
++        XCTAssertEqual(envelope.packageID, packageID)
++        XCTAssertEqual(try Data(contentsOf: source), original)
++        XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: root.path), ["wallpaper.dynor"])
++    }
++
++    func testLegacyLibraryKindsRemainDecodable() throws {
++        XCTAssertEqual(try JSONDecoder().decode(ImportedKind.self, from: Data("\"tendies\"".utf8)), .tendies)
++        XCTAssertEqual(try JSONDecoder().decode(ImportedKind.self, from: Data("\"image\"".utf8)), .image)
++        XCTAssertEqual(try JSONDecoder().decode(ImportedKind.self, from: Data("\"encryptedTendies\"".utf8)), .encryptedTendies)
++        XCTAssertTrue(ImportedKind.encryptedTendies.isTendies)
++        XCTAssertFalse(ImportedKind.image.isTendies)
++    }
++}
+--- a/Dynor-iOS/DynorTests/WallpaperDocumentTypesTests.swift
++++ b/Dynor-iOS/DynorTests/WallpaperDocumentTypesTests.swift
+@@ -18,6 +18,23 @@
+         for type in [UTType.zip, .archive, .data, .item, .image] {
+             XCTAssertTrue(identifiers.contains(type.identifier))
+         }
++    }
++
++    func testPickerAndAppRegisterEncryptedDynorPackagesAsData() throws {
++        let type = try XCTUnwrap(WallpaperDocumentTypes.pickerTypes.first {
++            $0.identifier == "com.dynor.encrypted-tendies"
++        })
++        XCTAssertTrue(type.conforms(to: .data))
++        for resolved in UTType.types(tag: "dynor", tagClass: .filenameExtension, conformingTo: nil) {
++            XCTAssertTrue(WallpaperDocumentTypes.pickerTypes.contains { $0.identifier == resolved.identifier })
++        }
++        let info = try XCTUnwrap(Bundle(for: DynorStore.self).infoDictionary)
++        let documents = try XCTUnwrap(info["CFBundleDocumentTypes"] as? [[String: Any]])
++        let encrypted = try XCTUnwrap(documents.first {
++            ($0["LSItemContentTypes"] as? [String])?.contains(type.identifier) == true
++        })
++        XCTAssertEqual(encrypted["CFBundleTypeRole"] as? String, "Viewer")
++        XCTAssertEqual(info["UIFileSharingEnabled"] as? Bool, false)
+     }
+ 
+     func testPairingPickerAcceptsKnownTypesAndEveryDocumentFallback() {
+--- /dev/null
++++ b/Dynor-iOS/ENCRYPTED_TENDIES_SETUP.md
+@@ -0,0 +1,135 @@
++# Thiết lập gói Tendies mã hóa cho Dynor
++
++Website riêng: [Dynor Vault](https://dynor-vault.amberstingray1.chatgpt.site). Công cụ nhận `.tendies`, mã hóa ngay trong trình duyệt và tạo `.dynor`. File hình nền gốc không được tải lên website hoặc Supabase trong bước mã hóa. Khóa nội dung được gửi qua HTTPS tới Edge Function dành cho quản trị viên để đăng ký; chỉ sau khi đăng ký thành công mới có thể tải file mã hóa về.
++
++Đây là hệ thống **cần triển khai backend trước khi dùng**, không chỉ là đổi đuôi file. Site riêng và quyền quản trị Supabase là hai lớp truy cập khác nhau: mở được Site vẫn phải đăng nhập email OTP bằng tài khoản có trong `dynor_admins`. Bản mã nguồn không chứa khóa giải mã production; các khóa cố định trong fixture là dữ liệu kiểm thử.
++
++## 1. Dùng đúng project, tài khoản và quyền VIP hiện có
++
++Project mặc định của app và website là `https://wkivekbodwbinmvargts.supabase.co`, project ref `wkivekbodwbinmvargts`. Nếu đổi project, phải đổi cấu hình công khai tương ứng trong app và website rồi build/publish lại. Supabase publishable/anon key chỉ nhận diện project; nó không phải khóa nội dung hay service-role key.
++
++Giữ nguyên hệ thống OTP, tài khoản, thanh toán và `dynor_vip` hiện có. Không tạo hệ thống VIP thứ hai. Backend kiểm tra quyền VIP bằng `plan_id` và `vip_expires_at`: quyền `lifetime` với ngày hết hạn `null`, hoặc ngày hết hạn còn ở tương lai. Việc hỗ trợ kiểm tra bản ghi lifetime không tự bật bán gói lifetime trong ứng dụng.
++
++## 2. Chạy SQL
++
++Trong Supabase Dashboard → SQL Editor của đúng project:
++
++1. Nếu chưa thiết lập Gallery online, chạy toàn bộ [Supabase/sql/wallpaper_online.sql](Supabase/sql/wallpaper_online.sql) theo [hướng dẫn online](WALLPAPER_ONLINE_SETUP.md). Không chạy lại script cũ có các `create policy` nếu đã thiết lập.
++2. Chạy **nguyên nội dung** [Supabase/sql/encrypted_packages.sql](Supabase/sql/encrypted_packages.sql). Đây là schema chính xác cho hai Edge Function bên dưới; không tự tạo bảng khóa với quyền đọc công khai. Script bổ sung bảng gói, RLS, quyền service-only và RPC giới hạn yêu cầu.
++3. Authentication → Users → sao chép UID tài khoản quản trị của chính bạn. Chạy SQL sau, thay giá trị mẫu bằng UUID thật:
++
++```sql
++insert into public.dynor_admins(user_id)
++values ('YOUR-AUTH-USER-UUID'::uuid)
++on conflict do nothing;
++```
++
++Không cấp `select` bảng `dynor_encrypted_packages` cho `anon` hoặc `authenticated`, kể cả để website quản trị tự đọc khóa. Quản trị viên đăng ký gói qua Function; chỉ server có service-role credential mới truy cập dữ liệu khóa. Bản ghi gói dùng UUID mới cho mỗi lần mã hóa; API không ghi đè ID, hash, khóa hoặc chính sách của gói đã có.
++
++## 3. Tạo và lưu secret KEK một lần
++
++`DYNOR_PACKAGE_KEK` là Base64 chuẩn của **đúng 32 byte ngẫu nhiên**. Nó dùng mã hóa khóa nội dung trong cơ sở dữ liệu và chỉ nằm ở Supabase Edge Function Secrets cùng bản sao bảo mật của bạn. Không nhập nó vào Dynor Vault, source iOS, GitHub, Sites, URL, ảnh chụp hoặc log build.
++
++Trên máy tin cậy đã cài Supabase CLI và Python 3, mở terminal tại thư mục source có `project.yml`. Tắt shell tracing; lệnh dưới tạo file tạm chỉ chủ tài khoản đọc được và không in giá trị khóa:
++
++```bash
++set +x
++umask 077
++dynor_secret_dir="$(mktemp -d)"
++python3 - "$dynor_secret_dir/package.env" <<'PY'
++import base64
++import secrets
++import sys
++
++with open(sys.argv[1], "x", encoding="ascii") as output:
++    output.write("DYNOR_PACKAGE_KEK=" + base64.b64encode(secrets.token_bytes(32)).decode("ascii") + "\n")
++PY
++supabase login
++supabase secrets set --project-ref wkivekbodwbinmvargts --env-file "$dynor_secret_dir/package.env"
++```
++
++Lưu bản sao của secret vào trình quản lý bí mật tin cậy bằng phương thức nhập file an toàn trước khi xóa file tạm. Không dùng `cat`, `echo` hoặc chế độ log debug để xem khóa. Khi đã xác nhận secret được lưu trên Supabase và bản sao bảo mật có thể khôi phục, dọn file tạm trong cùng phiên shell:
++
++```bash
++rm -- "$dynor_secret_dir/package.env"
++rmdir -- "$dynor_secret_dir"
++unset dynor_secret_dir
++```
++
++**Không chạy lại bước tạo khóa để cập nhật app hoặc deploy Function. Không tự động xoay KEK.** Thay/mất KEK làm server không mở được các khóa nội dung cũ và các `.dynor` đã phát hành ngừng cài được. Phiên bản hiện tại không có key version hay quy trình migration tự động. Nếu cần xoay, phải lên kế hoạch mở và bọc lại tất cả khóa bằng KEK cũ/mới trước khi chuyển secret; không chỉ ghi đè giá trị trong Dashboard.
++
++Hai Function còn cần `SUPABASE_URL`, `SUPABASE_ANON_KEY`, `SUPABASE_SERVICE_ROLE_KEY`, thường đã có sẵn trong môi trường Edge Functions. Nếu project thiếu, cấu hình phía server qua Supabase Secrets; không chuyển service-role key sang website hoặc iOS.
++
++## 4. Deploy đúng hai Edge Function
++
++Source dùng thư mục `Supabase/` viết hoa, khác layout CLI mặc định `supabase/functions/`. Lệnh sau tạo layout deploy tạm, giữ nguyên cả hai module dùng chung. Chạy từ thư mục chứa `project.yml`, sau bước đăng nhập CLI:
++
++```bash
++dynor_deploy_dir="$(mktemp -d)"
++supabase init --workdir "$dynor_deploy_dir"
++mkdir -p "$dynor_deploy_dir/supabase/functions"
++cp -R Supabase/_shared Supabase/dynor-register-package Supabase/dynor-package-key "$dynor_deploy_dir/supabase/functions/"
++supabase functions deploy dynor-register-package --project-ref wkivekbodwbinmvargts --no-verify-jwt --workdir "$dynor_deploy_dir"
++supabase functions deploy dynor-package-key --project-ref wkivekbodwbinmvargts --no-verify-jwt --workdir "$dynor_deploy_dir"
++```
++
++Deploy thành công cả hai rồi xóa thư mục deploy tạm:
++
++```bash
++rm -rf -- "$dynor_deploy_dir"
++unset dynor_deploy_dir
++```
++
++`--no-verify-jwt` tắt kiểm tra JWT tại **gateway của hai Function này** để tương thích cấu hình publishable key; không tắt đăng nhập trong code. Hai handler luôn xác minh Bearer token bằng `auth.getUser(jwt)`. `dynor-register-package` kiểm tra thêm quyền `dynor_admins`; `dynor-package-key` kiểm tra gói, hash, trạng thái active, chính sách VIP và quota. Không bỏ các kiểm tra này và không áp dụng thay đổi gateway hàng loạt cho Function khác.
++
++Không deploy riêng `index.ts` mà bỏ `_shared/package-handlers.mjs` hoặc `_shared/package-crypto.mjs`. Thiếu secret/schema hoặc lỗi tra quyền đều phải dừng cấp khóa. Giới hạn hiện tại là **30 lần yêu cầu khóa/tài khoản/60 giây**, gồm cả yêu cầu sai định dạng; hết quota trả 429 và cần chờ rồi thử lại.
++
++## 5. Mã hóa và phát hành nội dung
++
++1. Mở [Dynor Vault](https://dynor-vault.amberstingray1.chatgpt.site), đăng nhập OTP bằng email quản trị đã cấp ở bước 2.
++2. Chọn `.tendies` hợp lệ, không rỗng, tối đa 50 MiB. Trình duyệt kiểm tra dấu hiệu ZIP; Dynor vẫn kiểm tra toàn bộ archive và descriptor khi cài.
++3. Chọn chính sách gói **Yêu cầu VIP**. Mặc định bật. Khi tắt, mọi tài khoản Dynor đã đăng nhập đều có thể xin khóa của gói đang active nếu có file; đây không phải gói dành riêng cho người mua.
++4. Mã hóa và chờ đăng ký thành công, sau đó tải `ten-goi.dynor`. Công cụ không xuất khóa hoặc tạo file giải mã. Không chia sẻ file `.tendies` gốc nếu mục tiêu là chỉ phân phối bản mã hóa.
++5. Có thể gửi `.dynor` trực tiếp cho người dùng. Nếu muốn hiện ở Khám phá, mở trang quản trị Gallery hiện có, upload `.dynor` làm **File tải về**, thêm bìa/video và publish bài. Không upload `.tendies` gốc làm file tải thay thế.
++
++**Quyền VIP của gói độc lập với `is_vip` của bài Gallery.** `is_vip` kiểm soát tải từ catalog; `requires_vip` của gói kiểm soát cấp khóa kể cả khi file được nhập cục bộ. Muốn bảo vệ nội dung VIP, bật cả hai. Chỉ bật VIP cho bài Gallery trong khi đăng ký gói `requires_vip = false` không ngăn tài khoản thường mở bản `.dynor` được người khác gửi. API không sửa chính sách gói cũ: khi muốn đổi chính sách, tạo và phát hành gói mới với UUID mới.
++
++Nếu đăng ký thành công nhưng đóng trang trước khi tải file, khóa không được lưu trong local/session storage để khôi phục. Mở lại `.tendies` gốc và mã hóa thành gói mới; không cố ghi đè ID cũ. Giữ bản gốc riêng ở nơi an toàn để có thể phát hành lại khi cần.
++
++## 6. Cài bằng ứng dụng iOS
++
++Build/cài IPA mới có hỗ trợ `.dynor` bằng pipeline hiện có; số phiên bản không tự thay trong bộ mã này. Nhập `.dynor` qua Thư viện → `+`, Tệp → Mở bằng Dynor, hoặc tải từ Khám phá. Thư viện lưu **bản mã hóa**. File `.tendies` cũ vẫn nhập và cài bình thường; nó không tự trở thành file được bảo vệ.
++
++Với `.dynor`, **mỗi lần cài cần kết nối mạng và tài khoản đăng nhập còn hợp lệ**. Gói VIP yêu cầu quyền VIP hợp lệ ở thời điểm xin khóa. Khóa nội dung không được cache để cài offline. App tạo khóa P-256 không xuất được trong Secure Enclave; server bọc khóa nội dung cho khóa công khai này. Tham chiếu khóa thiết bị nằm trong Keychain `ThisDeviceOnly`. Không có fallback sang khóa tĩnh khi Secure Enclave/server không sẵn sàng; Simulator không thay thế kiểm tra trên iPhone thật.
++
++Sau giải mã, gói vẫn phải qua kiểm tra ZIP, CRC, đường dẫn, giới hạn giải nén và descriptor trước native write. Pairing, LocalDevVPN và phạm vi iOS được hỗ trợ giữ nguyên. Ảnh thường vẫn lưu vào Photos/chia sẻ ảnh; `.dynor` và `.tendies` không có nút xuất/chia sẻ gói trong app.
++
++Bản rõ tạm nằm trong `Application Support/Dynor/InstallStaging/<UUID>` với file protection đầy đủ, quyền thư mục 0700/file 0600 và loại khỏi backup. App cố dọn staging khi thành công/lỗi và dọn lại staging cũ lúc khởi động. Crash hoặc hệ điều hành không cho xóa có thể để lại dữ liệu đến lần dọn sau; thao tác xóa không phải cam kết xóa an toàn mọi dấu vết. Nội dung đã cài vào PosterBoard cần tồn tại để iOS hiển thị hình nền.
++
++## 7. Dừng cấp quyền một gói
++
++Trong SQL Editor bằng tài khoản sở hữu project, thay UUID mẫu bằng `package_id` của gói:
++
++```sql
++update public.dynor_encrypted_packages
++set active = false
++where package_id = 'PACKAGE-UUID'::uuid;
++```
++
++Muốn cho phép lại, đặt `active = true`. Để kiểm tra danh sách mà không đọc cột chứa khóa:
++
++```sql
++select package_id, original_name, requires_vip, active, created_at
++from public.dynor_encrypted_packages
++order by created_at desc;
++```
++
++Ẩn bài Gallery không tự thu hồi gói đã tải: phải tắt `active` nếu muốn ngừng cấp khóa. Thu hồi chặn lần cấp khóa tiếp theo; không xóa hình nền đã cài và không thu hồi được khóa đã cấp cho một thao tác đang chạy. Không xóa bảng hay mất KEK để thu hồi từng gói.
++
++## Giới hạn bảo vệ và kiểm tra trước khi dùng
++
++IPA tự ký có thể bị sửa hoặc ký lại. Backend này xác thực **tài khoản và quyền của gói**, không dùng App Attest để chứng minh ứng dụng Dynor nguyên bản. Client khác có token hợp lệ và quyền gói có thể gọi giao thức cấp khóa bằng khóa P-256 của chính nó; Secure Enclave ở app chính không khiến server tự nhận diện được client gốc. Không quảng cáo đây là cách tuyệt đối buộc mọi `.dynor` chỉ mở được trong IPA của bạn.
++
++Trong lúc cài, khóa nội dung và dữ liệu đã giải mã phải được sử dụng bởi tiến trình app; sau khi cài, PosterBoard giữ nội dung. Thiết bị bị can thiệp, client đã sửa hoặc tài khoản có quyền có thể trích xuất và phân phối lại. Cơ chế này tránh nhúng khóa dùng chung trong source và quản lý việc cấp khóa; không có cam kết chống trích xuất tuyệt đối.
++
++Xem [VERIFICATION.md](VERIFICATION.md) để kiểm tra đúng/sai quyền, hash/tag, thu hồi, cleanup và tương thích iOS. Chạy unit test/mô phỏng trên Linux không xác nhận deploy Supabase, Secure Enclave, build Xcode hoặc cài hình nền trên iPhone thành công.
+--- a/Dynor-iOS/README.md
++++ b/Dynor-iOS/README.md
+@@ -12,7 +12,8 @@
+ - Viền các nút danh mục như “Tất cả” được vẽ bằng `strokeBorder` và có khoảng đệm trong thanh cuộn, tránh cắt viền trên/dưới và hai đầu.
+ - Thư viện → mở tệp Tendies → **Cài hình nền**: kiểm tra archive, tự tìm PosterBoard container, ghi các descriptor và cập nhật tùy chọn bằng AirliftFFI thật. Có tiến trình, log và lỗi khi chưa kết nối hoặc ghi chưa hoàn tất.
+ - “Mở bằng Dynor” từ Tệp tự chuyển tới Thư viện và mở hình nền vừa nhập; file pairing mở tab Pairing. Nhập một tệp trong Thư viện cũng mở ngay màn hình xem trước/cài đặt.
+-- Khám phá → **Tải và mở trong Dynor**: ảnh và `.tendies` được thêm vào Thư viện rồi mở ngay màn hình xem trước; Tendies có nút **Cài hình nền**. Tệp định dạng khác giữ bảng chia sẻ.
++- Khám phá → **Tải và mở trong Dynor**: ảnh và `.tendies` được thêm vào Thư viện rồi mở ngay màn hình xem trước; Tendies có nút **Cài hình nền**. Tệp định dạng khác báo không hỗ trợ và được dọn khỏi thư mục tải tạm.
++- Gói Tendies không có chức năng xuất hoặc chia sẻ tệp gốc. Ảnh vẫn có thể chia sẻ và lưu vào Photos.
+ - Tự tìm địa chỉ IPv4 đang hoạt động của thiết bị, ưu tiên Wi-Fi và dùng `10.7.0.1` dự phòng. Không ép kết nối trực tiếp tới địa chỉ loopback.
+ - Nhận diện descriptor theo cấu trúc bên trong gói, hỗ trợ hai chiều tên extension Collections/Mercury cũ và mới, giữ các identifier ký hiệu và suggestion metadata cần cho PosterKit.
+ - Khóa mở tệp khác, xóa hình nền và đổi/xóa pairing trong khi đang cài.
+@@ -101,3 +102,4 @@
+ ## Nguồn và giấy phép
+ 
+ AirliftFFI và mã pairing/Tendies được điều chỉnh từ [Mak5er/AirCard-iOS](https://github.com/Mak5er/AirCard-iOS), MIT, revision `40640c4d827aeab8d798285b57d24fcf6be070d0`. Xem `ThirdParty/AirCard/LICENSE`, `provenance.json` và `Cargo.lock`. Hash các file framework được đối chiếu với Git tree upstream. Ảnh mẫu: `Dynor/Resources/Wallpapers/sources.json` (Unsplash). Icon theo nguồn ban đầu do người dùng cung cấp.
++- **Gói mã hóa `.dynor`**: tạo bằng [Dynor Vault](https://dynor-vault.amberstingray1.chatgpt.site). App giữ bản mã trong Thư viện, xin khóa từ server khi cài và không xuất gói đã giải mã. Cần triển khai backend trước theo [ENCRYPTED_TENDIES_SETUP.md](ENCRYPTED_TENDIES_SETUP.md).
+--- /dev/null
++++ b/Dynor-iOS/Supabase/_shared/package-crypto.mjs
+@@ -0,0 +1,119 @@
++// WebCrypto wire format shared by the Deno endpoints and Node interoperability tests.
++// No content key, KEK, service-role token, or private device key belongs in this file.
++export const PACKAGE_MAGIC = new TextEncoder().encode('DYNORT01');
++export const KEY_WRAP_INFO = new TextEncoder().encode('DynorContentKey/v1');
++
++export class PackageInputError extends Error {}
++
++export function packageID(value) {
++  if (typeof value !== 'string' || !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(value)) {
++    throw new PackageInputError('Invalid package_id');
++  }
++  return value;
++}
++
++export function contentHash(value) {
++  if (typeof value !== 'string' || !/^[0-9a-f]{64}$/.test(value)) {
++    throw new PackageInputError('Invalid sha256');
++  }
++  return value;
++}
++
++export function originalName(value) {
++  if (typeof value !== 'string' || value.length < 9 || [...value].length > 255 ||
++      /[\x00-\x1f\x7f/\\]/.test(value) || value.trim() !== value || !/\.tendies$/i.test(value)) {
++    throw new PackageInputError('Invalid original_name');
++  }
++  return value;
++}
++
++export function base64(bytes) {
++  // All callers encode small keys/nonces, never the wallpaper itself.
++  return btoa(String.fromCharCode(...new Uint8Array(bytes)));
++}
++
++export function decodeBase64(value, length, label = 'key') {
++  if (typeof value !== 'string' || value.length !== 4 * Math.ceil(length / 3) ||
++      !/^[A-Za-z0-9+/]+={0,2}$/.test(value)) {
++    throw new PackageInputError(`Invalid ${label}`);
++  }
++  let bytes;
++  try { bytes = Uint8Array.from(atob(value), c => c.charCodeAt(0)); }
++  catch { throw new PackageInputError(`Invalid ${label}`); }
++  if (bytes.length !== length || base64(bytes) !== value) {
++    throw new PackageInputError(`Invalid ${label}`);
++  }
++  return bytes;
++}
++
++export function packageHeader(id) {
++  const header = new Uint8Array(24);
++  header.set(PACKAGE_MAGIC);
++  const hex = packageID(id).replaceAll('-', '');
++  for (let i = 0; i < 16; i++) header[8 + i] = Number.parseInt(hex.slice(i * 2, i * 2 + 2), 16);
++  return header;
++}
++
++function combined(iv, encrypted) {
++  const result = new Uint8Array(iv.length + encrypted.byteLength);
++  result.set(iv);
++  result.set(new Uint8Array(encrypted), iv.length);
++  return result;
++}
++
++export async function importKEK(value) {
++  const bytes = decodeBase64(value, 32, 'DYNOR_PACKAGE_KEK');
++  try { return await crypto.subtle.importKey('raw', bytes, 'AES-GCM', false, ['encrypt', 'decrypt']); }
++  finally { bytes.fill(0); }
++}
++
++export async function wrapAtRest(rawKey, kek, id) {
++  if (!(rawKey instanceof Uint8Array) || rawKey.byteLength !== 32) throw new PackageInputError('Invalid content key');
++  const nonce = crypto.getRandomValues(new Uint8Array(12));
++  const encrypted = await crypto.subtle.encrypt(
++    { name: 'AES-GCM', iv: nonce, additionalData: packageHeader(id), tagLength: 128 }, kek, rawKey,
++  );
++  return base64(combined(nonce, encrypted));
++}
++
++export async function unwrapAtRest(wrapped, kek, id) {
++  const body = decodeBase64(wrapped, 60, 'stored key');
++  const rawKey = await crypto.subtle.decrypt(
++    { name: 'AES-GCM', iv: body.subarray(0, 12), additionalData: packageHeader(id), tagLength: 128 },
++    kek, body.subarray(12),
++  );
++  if (rawKey.byteLength !== 32) throw new Error('Invalid stored key length');
++  return new Uint8Array(rawKey);
++}
++
++export async function recipientPublicKey(encoded) {
++  const raw = decodeBase64(encoded, 65, 'public_key');
++  if (raw[0] !== 4) throw new PackageInputError('Invalid public_key');
++  try {
++    return await crypto.subtle.importKey('raw', raw, { name: 'ECDH', namedCurve: 'P-256' }, false, []);
++  } catch { throw new PackageInputError('Invalid public_key'); }
++}
++
++export async function wrapForRecipient(rawKey, recipient, id) {
++  if (!(rawKey instanceof Uint8Array) || rawKey.byteLength !== 32) throw new PackageInputError('Invalid content key');
++  const ephemeral = await crypto.subtle.generateKey({ name: 'ECDH', namedCurve: 'P-256' }, true, ['deriveBits']);
++  const shared = new Uint8Array(await crypto.subtle.deriveBits({ name: 'ECDH', public: recipient }, ephemeral.privateKey, 256));
++  const salt = crypto.getRandomValues(new Uint8Array(16));
++  let wrappingKey;
++  try {
++    const material = await crypto.subtle.importKey('raw', shared, 'HKDF', false, ['deriveKey']);
++    wrappingKey = await crypto.subtle.deriveKey(
++      { name: 'HKDF', hash: 'SHA-256', salt, info: KEY_WRAP_INFO }, material,
++      { name: 'AES-GCM', length: 256 }, false, ['encrypt'],
++    );
++  } finally { shared.fill(0); }
++  const nonce = crypto.getRandomValues(new Uint8Array(12));
++  const ciphertext = await crypto.subtle.encrypt(
++    { name: 'AES-GCM', iv: nonce, additionalData: packageHeader(id), tagLength: 128 }, wrappingKey, rawKey,
++  );
++  return {
++    ephemeral_public_key: base64(await crypto.subtle.exportKey('raw', ephemeral.publicKey)),
++    salt: base64(salt),
++    wrapped_key: base64(combined(nonce, ciphertext)),
++  };
++}
+--- /dev/null
++++ b/Dynor-iOS/Supabase/_shared/package-handlers.mjs
+@@ -0,0 +1,146 @@
++import {
++  PackageInputError, packageID, contentHash, originalName, decodeBase64,
++  importKEK, recipientPublicKey, wrapAtRest, unwrapAtRest, wrapForRecipient,
++} from './package-crypto.mjs';
++
++const MAX_BODY_BYTES = 4096;
++const HEADERS = {
++  'Content-Type': 'application/json; charset=utf-8',
++  'Cache-Control': 'no-store',
++  'Access-Control-Allow-Origin': '*',
++  'Access-Control-Allow-Methods': 'POST, OPTIONS',
++  'Access-Control-Allow-Headers': 'authorization, apikey, content-type, x-client-info',
++  'Access-Control-Max-Age': '600',
++  'X-Content-Type-Options': 'nosniff',
++};
++
++function reply(body, status = 200, extraHeaders = {}) {
++  return new Response(JSON.stringify(body), { status, headers: { ...HEADERS, ...extraHeaders } });
++}
++
++class HTTPFailure extends Error {
++  constructor(message, status) { super(message); this.status = status; }
++}
++
++async function readBody(req) {
++  if (!/^application\/json(?:\s*;|$)/i.test(req.headers.get('content-type') ?? '')) {
++    throw new HTTPFailure('Content-Type must be application/json', 415);
++  }
++  const declared = req.headers.get('content-length');
++  if (declared !== null && (!/^\d+$/.test(declared) || Number(declared) > MAX_BODY_BYTES)) {
++    throw new HTTPFailure('Request too large', 413);
++  }
++  if (!req.body) throw new HTTPFailure('Invalid JSON', 400);
++  const reader = req.body.getReader();
++  const chunks = [];
++  let size = 0;
++  try {
++    while (true) {
++      const { value, done } = await reader.read();
++      if (done) break;
++      size += value.byteLength;
++      if (size > MAX_BODY_BYTES) {
++        await reader.cancel();
++        throw new HTTPFailure('Request too large', 413);
++      }
++      chunks.push(value);
++    }
++  } finally { reader.releaseLock(); }
++  const bytes = new Uint8Array(size);
++  let offset = 0;
++  for (const chunk of chunks) { bytes.set(chunk, offset); offset += chunk.byteLength; }
++  let result;
++  try { result = JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(bytes)); }
++  catch { throw new HTTPFailure('Invalid JSON', 400); }
++  if (!result || typeof result !== 'object' || Array.isArray(result)) throw new HTTPFailure('Invalid JSON object', 400);
++  return result;
++}
++
++function isVIP(record, now) {
++  return !!record && (
++    (record.plan_id === 'lifetime' && record.vip_expires_at === null) ||
++    (typeof record.vip_expires_at === 'string' && Date.parse(record.vip_expires_at) > now)
++  );
++}
++
++// Keep transport/auth/database dependencies injectable so authorization and failure
++// handling are exercised without a live Supabase project or production credentials.
++export function createPackageHandler(mode, { createClient, env, now = () => Date.now() }) {
++  if (mode !== 'register' && mode !== 'key') throw new Error('Unknown package endpoint');
++  return async function handle(req) {
++    if (req.method === 'OPTIONS') return new Response(null, { status: 204, headers: HEADERS });
++    if (req.method !== 'POST') return reply({ error: 'Method not allowed' }, 405, { Allow: 'POST, OPTIONS' });
++    let rawKey;
++    try {
++      const url = env('SUPABASE_URL');
++      const anon = env('SUPABASE_ANON_KEY');
++      const service = env('SUPABASE_SERVICE_ROLE_KEY');
++      const rawKEK = env('DYNOR_PACKAGE_KEK');
++      if (!url || !anon || !service || !rawKEK) throw new HTTPFailure('Package service is not configured', 503);
++      let kek;
++      try { kek = await importKEK(rawKEK); }
++      catch { throw new HTTPFailure('Package service is not configured', 503); }
++      const authorization = req.headers.get('authorization') ?? '';
++      const match = /^Bearer ([^\s]+)$/i.exec(authorization);
++      if (!match) throw new HTTPFailure('Login required', 401);
++      const jwt = match[1];
++      const auth = createClient(url, anon, {
++        global: { headers: { Authorization: `Bearer ${jwt}` } },
++        auth: { persistSession: false, autoRefreshToken: false },
++      });
++      const { data: authData, error: authError } = await auth.auth.getUser(jwt);
++      if (authError || !authData?.user?.id) throw new HTTPFailure('Invalid session', 401);
++      const userID = authData.user.id;
++      const db = createClient(url, service, { auth: { persistSession: false, autoRefreshToken: false } });
++
++      if (mode === 'register') {
++        const { data: admin, error } = await db.from('dynor_admins').select('user_id').eq('user_id', userID).maybeSingle();
++        if (error) throw new HTTPFailure('Admin verification unavailable', 503);
++        if (!admin) throw new HTTPFailure('Admin access required', 403);
++      } else {
++        // Count attempts before package lookup, including malformed/probing requests.
++        // RPC uses a single UPSERT so concurrent calls cannot bypass the limit.
++        const { data: allowed, error } = await db.rpc('dynor_consume_package_key_limit', { p_user_id: userID });
++        if (error) throw new HTTPFailure('Request verification unavailable', 503);
++        if (allowed !== true) return reply({ error: 'Too many key requests; try again later' }, 429, { 'Retry-After': '60' });
++      }
++
++      const body = await readBody(req);
++      const id = packageID(body.package_id);
++      const sha256 = contentHash(body.sha256);
++      if (mode === 'register') {
++        const name = originalName(body.original_name);
++        if (typeof body.requires_vip !== 'boolean') throw new PackageInputError('Invalid requires_vip');
++        rawKey = decodeBase64(body.key_base64, 32, 'key_base64');
++        const wrappedKey = await wrapAtRest(rawKey, kek, id);
++        const { error } = await db.from('dynor_encrypted_packages').insert({
++          package_id: id, sha256, wrapped_key: wrappedKey, original_name: name,
++          requires_vip: body.requires_vip, created_by: userID,
++        });
++        if (error?.code === '23505') throw new HTTPFailure('Package already registered; encrypt as a new package', 409);
++        if (error) throw new HTTPFailure('Could not register package', 503);
++        return reply({ package_id: id, sha256 }, 201);
++      }
++
++      const recipient = await recipientPublicKey(body.public_key);
++      const { data: record, error } = await db.from('dynor_encrypted_packages')
++        .select('package_id,sha256,wrapped_key,requires_vip,active').eq('package_id', id).maybeSingle();
++      if (error) throw new HTTPFailure('Package verification unavailable', 503);
++      if (!record || record.active !== true || record.sha256 !== sha256) throw new HTTPFailure('Package unavailable', 404);
++      if (record.requires_vip) {
++        const { data: vip, error: vipError } = await db.from('dynor_vip')
++          .select('vip_expires_at,plan_id').eq('user_id', userID).maybeSingle();
++        if (vipError) throw new HTTPFailure('VIP verification unavailable', 503);
++        if (!isVIP(vip, now())) throw new HTTPFailure('VIP required', 403);
++      }
++      try { rawKey = await unwrapAtRest(record.wrapped_key, kek, id); }
++      catch { throw new HTTPFailure('Package service unavailable', 503); }
++      return reply(await wrapForRecipient(rawKey, recipient, id));
++    } catch (error) {
++      if (error instanceof HTTPFailure) return reply({ error: error.message }, error.status);
++      if (error instanceof PackageInputError) return reply({ error: error.message }, 400);
++      // Do not echo SDK/crypto exceptions: they may contain request data or keys.
++      return reply({ error: 'Package service unavailable' }, 503);
++    } finally { rawKey?.fill(0); }
++  };
++}
+--- /dev/null
++++ b/Dynor-iOS/Supabase/dynor-package-key/index.ts
+@@ -0,0 +1,4 @@
++import { createClient } from 'https://esm.sh/@supabase/supabase-js@2';
++import { createPackageHandler } from '../_shared/package-handlers.mjs';
++
++Deno.serve(createPackageHandler('key', { createClient, env: (name: string) => Deno.env.get(name) }));
+--- /dev/null
++++ b/Dynor-iOS/Supabase/dynor-register-package/index.ts
+@@ -0,0 +1,4 @@
++import { createClient } from 'https://esm.sh/@supabase/supabase-js@2';
++import { createPackageHandler } from '../_shared/package-handlers.mjs';
++
++Deno.serve(createPackageHandler('register', { createClient, env: (name: string) => Deno.env.get(name) }));
+--- /dev/null
++++ b/Dynor-iOS/Supabase/sql/encrypted_packages.sql
+@@ -0,0 +1,96 @@
++-- Run after wallpaper_online.sql in the same Supabase project.
++-- Only Edge Functions with the service-role credential may access these tables.
++-- User JWTs, including administrator JWTs, never receive table access to keys.
++begin;
++
++create table if not exists public.dynor_encrypted_packages (
++  package_id uuid primary key,
++  sha256 text not null check (sha256 ~ '^[0-9a-f]{64}$'),
++  -- AES-GCM at rest: nonce (12) || encrypted CEK (32) || tag (16).
++  -- 60 bytes have an exact 80-character, unpadded standard Base64 encoding.
++  wrapped_key text not null check (wrapped_key ~ '^[A-Za-z0-9+/]{80}$'),
++  original_name text not null check (
++    char_length(original_name) between 1 and 255
++    and lower(right(original_name, 8)) = '.tendies'
++    and position('/' in original_name) = 0
++    and position(chr(92) in original_name) = 0
++    and original_name !~ '[[:cntrl:]]'
++  ),
++  requires_vip boolean not null default true,
++  active boolean not null default true,
++  created_by uuid references auth.users(id) on delete set null,
++  created_at timestamptz not null default now()
++);
++
++alter table public.dynor_encrypted_packages enable row level security;
++revoke all on table public.dynor_encrypted_packages
++  from public, anon, authenticated, service_role;
++grant select, insert on table public.dynor_encrypted_packages to service_role;
++-- Registration uses INSERT, never UPSERT. A package ID cannot replace an old key.
++-- The service may revoke/reactivate a package, but cannot rewrite its identity,
++-- content hash, key, or access policy. Owner SQL remains available for operations.
++grant update (active) on table public.dynor_encrypted_packages to service_role;
++
++create table if not exists public.dynor_package_key_rate_limits (
++  user_id uuid primary key references auth.users(id) on delete cascade,
++  window_started_at timestamptz not null,
++  request_count integer not null check (request_count between 1 and 31)
++);
++
++alter table public.dynor_package_key_rate_limits enable row level security;
++revoke all on table public.dynor_package_key_rate_limits
++  from public, anon, authenticated, service_role;
++
++-- One INSERT ... ON CONFLICT serializes concurrent requests for the same user.
++-- Requests beyond the limit saturate at 31 and remain denied until the window
++-- expires. Request counters therefore cannot overflow or reset under contention.
++create or replace function public.dynor_consume_package_key_limit(p_user_id uuid)
++returns boolean
++language plpgsql
++security definer
++set search_path = ''
++as $$
++declare
++  v_now timestamptz := clock_timestamp();
++  v_count integer;
++begin
++  if p_user_id is null then
++    return false;
++  end if;
++
++  insert into public.dynor_package_key_rate_limits as quota
++    (user_id, window_started_at, request_count)
++  values
++    (p_user_id, v_now, 1)
++  on conflict (user_id) do update
++  set window_started_at = case
++        when quota.window_started_at <= v_now - interval '60 seconds'
++          then v_now
++        else quota.window_started_at
++      end,
++      request_count = case
++        when quota.window_started_at <= v_now - interval '60 seconds'
++          then 1
++        else least(quota.request_count + 1, 31)
++      end
++  returning request_count into v_count;
++
++  return v_count <= 30;
++end;
++$$;
++
++revoke all on function public.dynor_consume_package_key_limit(uuid)
++  from public, anon, authenticated, service_role;
++grant execute on function public.dynor_consume_package_key_limit(uuid)
++  to service_role;
++
++comment on table public.dynor_encrypted_packages is
++  'Server-only encrypted content keys; DYNOR_PACKAGE_KEK is held in Edge Function secrets.';
++comment on function public.dynor_consume_package_key_limit(uuid) is
++  'Service-only atomic fixed-window limit: 30 key-release attempts per user per 60 seconds.';
++
++-- Owner SQL can revoke a package without deleting its audit or encryption record:
++-- update public.dynor_encrypted_packages set active = false
++-- where package_id = '00000000-0000-0000-0000-000000000000';
++
++commit;
+--- /dev/null
++++ b/Dynor-iOS/Supabase/tests/encrypted-packages.test.mjs
+@@ -0,0 +1,287 @@
++import test from 'node:test';
++import assert from 'node:assert/strict';
++import { createECDH, createDecipheriv, createHash, hkdfSync, randomBytes } from 'node:crypto';
++import { readFile } from 'node:fs/promises';
++import { pathToFileURL } from 'node:url';
++import {
++  packageHeader, packageID, contentHash, originalName, base64, decodeBase64,
++  importKEK, wrapAtRest, unwrapAtRest, recipientPublicKey, wrapForRecipient,
++} from '../_shared/package-crypto.mjs';
++import { createPackageHandler } from '../_shared/package-handlers.mjs';
++
++const ID = '29abc356-4854-4d22-8dbb-a232a411a057';
++const OTHER_ID = '93b9af25-eccc-417d-b04c-a3788aef5382';
++const HASH = 'ab'.repeat(32);
++const USER_ID = '563456bf-d0a8-4b8b-bcb4-529e92db7326';
++const CEK = new Uint8Array(randomBytes(32));
++const KEK = base64(randomBytes(32));
++const ENV = { SUPABASE_URL: 'https://project.invalid', SUPABASE_ANON_KEY: 'test-anon', SUPABASE_SERVICE_ROLE_KEY: 'test-service', DYNOR_PACKAGE_KEK: KEK };
++
++function clientRecipient() {
++  const ec = createECDH('prime256v1');
++  ec.generateKeys();
++  return {
++    public_key: ec.getPublicKey().toString('base64'),
++    unwrap(response, id = ID) {
++      const secret = ec.computeSecret(Buffer.from(response.ephemeral_public_key, 'base64'));
++      const wrapping = hkdfSync('sha256', secret, Buffer.from(response.salt, 'base64'), Buffer.from('DynorContentKey/v1'), 32);
++      const combined = Buffer.from(response.wrapped_key, 'base64');
++      assert.equal(combined.length, 60);
++      const decrypt = createDecipheriv('aes-256-gcm', wrapping, combined.subarray(0, 12));
++      decrypt.setAAD(packageHeader(id));
++      decrypt.setAuthTag(combined.subarray(-16));
++      return Buffer.concat([decrypt.update(combined.subarray(12, -16)), decrypt.final()]);
++    },
++  };
++}
++
++function fakeDependencies(overrides = {}) {
++  const state = {
++    user: { id: USER_ID }, admin: { user_id: USER_ID },
++    allowed: true, record: null, vip: null, inserts: [], reads: [], rpcCalls: [],
++    ...overrides,
++  };
++  const db = {
++    from(table) {
++      state.reads.push(table);
++      return {
++        select() { return this; }, eq() { return this; },
++        async maybeSingle() {
++          if (state.throwDatabase) throw new Error('internal: SECRET_DO_NOT_RETURN');
++          const key = { dynor_admins: 'admin', dynor_encrypted_packages: 'record', dynor_vip: 'vip' }[table];
++          return { data: state[key], error: state[`${key}Error`] ?? null };
++        },
++        async insert(row) { state.inserts.push(row); return { error: state.insertError ?? null }; },
++      };
++    },
++    async rpc(name, args) { state.rpcCalls.push([name, args]); return { data: state.allowed, error: state.rpcError ?? null }; },
++  };
++  const createClient = (_url, key) => key === ENV.SUPABASE_SERVICE_ROLE_KEY ? db : {
++    auth: { async getUser() { return { data: { user: state.user }, error: state.authError ?? null }; } },
++  };
++  return { state, createClient, env: key => (state.env ?? ENV)[key], now: () => Date.parse('2026-11-16T00:00:00Z') };
++}
++
++function request(body, extra = {}) {
++  const headers = { authorization: 'Bearer valid-test-jwt', 'content-type': 'application/json', ...extra.headers };
++  return new Request('https://server.invalid/functions/v1/dynor-package-key', {
++    method: 'POST', ...extra, headers,
++    body: typeof body === 'string' ? body : JSON.stringify(body),
++  });
++}
++
++async function registeredRecord() {
++  const kek = await importKEK(KEK);
++  return {
++    package_id: ID, sha256: HASH, wrapped_key: await wrapAtRest(CEK, kek, ID),
++    requires_vip: false, active: true,
++  };
++}
++
++const registration = () => ({ package_id: ID, sha256: HASH, key_base64: base64(CEK), original_name: 'My Wallpaper.tendies', requires_vip: true });
++
++test('binary header agrees with fixed magic and UUID network byte order', () => {
++  assert.equal(Buffer.from(packageHeader(ID)).toString('hex'), '44594e4f5254303129abc35648544d228dbba232a411a057');
++});
++
++test('validators reject ambiguous identifiers, invalid filenames and noncanonical Base64', async () => {
++  assert.throws(() => packageID(ID.toUpperCase()));
++  assert.throws(() => packageID('../wallpaper'));
++  assert.throws(() => contentHash('AB'.repeat(32)));
++  for (const name of ['../wallpaper.tendies', 'folder\\file.tendies', 'file.tendies\n', '.tendies', 'file.zip']) assert.throws(() => originalName(name));
++  assert.equal(originalName('Mẫu hình nền.TENDIES'), 'Mẫu hình nền.TENDIES');
++  assert.throws(() => decodeBase64(' '.repeat(44), 32));
++  assert.throws(() => decodeBase64('A'.repeat(42) + 'B=', 32)); // 43rd sextet has discarded nonzero bits.
++  assert.throws(() => decodeBase64(base64(CEK).replace(/=$/, ''), 32));
++  await assert.rejects(recipientPublicKey(base64(new Uint8Array(65))));
++  const invalidPoint = new Uint8Array(65); invalidPoint[0] = 4;
++  await assert.rejects(recipientPublicKey(base64(invalidPoint)));
++});
++
++test('at-rest encryption authenticates package ID and rejects ciphertext tampering', async () => {
++  const kek = await importKEK(KEK);
++  const wrapped = await wrapAtRest(CEK, kek, ID);
++  assert.deepEqual(await unwrapAtRest(wrapped, kek, ID), CEK);
++  assert.notEqual(wrapped, base64(CEK));
++  await assert.rejects(unwrapAtRest(wrapped, kek, OTHER_ID));
++  const tampered = decodeBase64(wrapped, 60); tampered[22] ^= 1;
++  await assert.rejects(unwrapAtRest(base64(tampered), kek, ID));
++  await assert.rejects(unwrapAtRest(wrapped, await importKEK(base64(randomBytes(32))), ID));
++});
++
++test('recipient wrap interoperates with independent Node ECDH/HKDF/AES implementation', async () => {
++  const recipient = clientRecipient();
++  const response = await wrapForRecipient(CEK, await recipientPublicKey(recipient.public_key), ID);
++  assert.deepEqual(recipient.unwrap(response), Buffer.from(CEK));
++  assert.throws(() => recipient.unwrap(response, OTHER_ID));
++  assert.throws(() => clientRecipient().unwrap(response));
++  const tampered = Buffer.from(response.wrapped_key, 'base64'); tampered[20] ^= 1;
++  assert.throws(() => recipient.unwrap({ ...response, wrapped_key: tampered.toString('base64') }));
++  assert.deepEqual(Object.keys(response).sort(), ['ephemeral_public_key', 'salt', 'wrapped_key']);
++});
++
++test('only authenticated admins can register; success stores wrapped key and returns no key', async () => {
++  for (const overrides of [{ user: null }, { admin: null }]) {
++    const deps = fakeDependencies(overrides);
++    const response = await createPackageHandler('register', deps)(request(registration()));
++    assert.equal(response.status, overrides.user === null ? 401 : 403);
++    assert.equal(deps.state.inserts.length, 0);
++  }
++  const deps = fakeDependencies();
++  const response = await createPackageHandler('register', deps)(request(registration()));
++  assert.equal(response.status, 201);
++  assert.deepEqual(await response.json(), { package_id: ID, sha256: HASH });
++  assert.equal(deps.state.inserts.length, 1);
++  const stored = deps.state.inserts[0];
++  assert.equal(stored.created_by, USER_ID);
++  assert.equal(stored.requires_vip, true);
++  assert.notEqual(stored.wrapped_key, base64(CEK));
++  assert.deepEqual(await unwrapAtRest(stored.wrapped_key, await importKEK(KEK), ID), CEK);
++  assert.equal(stored.key_base64, undefined);
++});
++
++test('duplicate registration fails instead of overwriting an existing key', async () => {
++  const deps = fakeDependencies({ insertError: { code: '23505', message: 'secret details' } });
++  const response = await createPackageHandler('register', deps)(request(registration()));
++  assert.equal(response.status, 409);
++  assert.doesNotMatch(await response.text(), /secret details/);
++});
++
++test('key release enforces login, package status/hash and successful rate check', async () => {
++  const recipient = clientRecipient();
++  const body = { package_id: ID, sha256: HASH, public_key: recipient.public_key };
++  const record = await registeredRecord();
++  for (const [overrides, status] of [
++    [{ user: null, record }, 401],
++    [{ record: null }, 404],
++    [{ record: { ...record, active: false } }, 404],
++    [{ record: { ...record, sha256: 'cd'.repeat(32) } }, 404],
++    [{ record, allowed: false }, 429],
++    [{ record, rpcError: { message: 'unavailable' } }, 503],
++  ]) {
++    const deps = fakeDependencies(overrides);
++    const response = await createPackageHandler('key', deps)(request(body));
++    assert.equal(response.status, status);
++    const result = await response.json();
++    assert.equal(result.wrapped_key, undefined);
++    if (status === 429) {
++      assert.equal(response.headers.get('retry-after'), '60');
++      assert.equal(deps.state.reads.includes('dynor_encrypted_packages'), false);
++    }
++  }
++  const deps = fakeDependencies({ record });
++  const response = await createPackageHandler('key', deps)(request(body));
++  assert.equal(response.status, 200);
++  assert.equal(response.headers.get('cache-control'), 'no-store');
++  assert.deepEqual(recipient.unwrap(await response.json()), Buffer.from(CEK));
++  assert.deepEqual(deps.state.rpcCalls, [['dynor_consume_package_key_limit', { p_user_id: USER_ID }]]);
++});
++
++test('VIP gate rejects absent/expired membership, permits lifetime and future expiry, fails closed on lookup errors', async () => {
++  const recipient = clientRecipient();
++  const body = { package_id: ID, sha256: HASH, public_key: recipient.public_key };
++  const record = { ...await registeredRecord(), requires_vip: true };
++  for (const [vip, status, vipError] of [
++    [null, 403],
++    [{ plan_id: 'monthly', vip_expires_at: '2026-11-15T23:59:59Z' }, 403],
++    [{ plan_id: 'monthly', vip_expires_at: 'invalid-date' }, 403],
++    [{ plan_id: 'lifetime', vip_expires_at: null }, 200],
++    [{ plan_id: 'monthly', vip_expires_at: '2027-01-01T00:00:00Z' }, 200],
++    [null, 503, { message: 'database unavailable' }],
++  ]) {
++    const deps = fakeDependencies({ record, vip, vipError });
++    const response = await createPackageHandler('key', deps)(request(body));
++    assert.equal(response.status, status);
++    if (status === 200) assert.deepEqual(recipient.unwrap(await response.json()), Buffer.from(CEK));
++  }
++});
++
++test('bounded request reader rejects oversized bodies, JSON arrays and wrong media type', async () => {
++  const invalid = [
++    [request(' '.repeat(4097)), 413],
++    [request('{}', { headers: { 'content-length': '5000' } }), 413],
++    [request('[]'), 400],
++    [request('{'), 400],
++    [request('{}', { headers: { 'content-type': 'text/plain' } }), 415],
++  ];
++  for (const [req, status] of invalid) {
++    const deps = fakeDependencies();
++    const response = await createPackageHandler('register', deps)(req);
++    assert.equal(response.status, status);
++    assert.equal(deps.state.inserts.length, 0);
++  }
++});
++
++test('preflight works without credentials; non-POST methods expose no server data', async () => {
++  const deps = fakeDependencies({ env: {} });
++  const handler = createPackageHandler('register', deps);
++  const preflight = await handler(new Request('https://server.invalid', { method: 'OPTIONS' }));
++  assert.equal(preflight.status, 204);
++  assert.match(preflight.headers.get('access-control-allow-headers'), /authorization/);
++  assert.equal((await handler(new Request('https://server.invalid'))).status, 405);
++  assert.equal((await handler(request(registration()))).status, 503);
++});
++
++test('unexpected server/crypto errors do not disclose request data or secrets', async () => {
++  const deps = fakeDependencies({ throwDatabase: true });
++  const response = await createPackageHandler('register', deps)(request(registration()));
++  assert.equal(response.status, 503);
++  assert.deepEqual(await response.json(), { error: 'Package service unavailable' });
++  const brokenKEK = fakeDependencies({ env: { ...ENV, DYNOR_PACKAGE_KEK: 'invalid' } });
++  assert.equal((await createPackageHandler('register', brokenKEK)(request(registration()))).status, 503);
++});
++
++test('browser package survives admin registration and authorized recipient release, while substitution and tampering fail', async () => {
++  // The delivered ZIP keeps the browser tool beside Supabase. During development
++  // its independent Site checkout can be selected without copying production data.
++  const vaultRoot = process.env.DYNOR_VAULT_ROOT
++    ? pathToFileURL(process.env.DYNOR_VAULT_ROOT.replace(/\/$/, '') + '/')
++    : new URL('../../Tools/DynorVault/', import.meta.url);
++  const { encryptTendies } = await import(new URL('dist/crypto.mjs', vaultRoot));
++  const vector = JSON.parse(await readFile(new URL('tests/interop-v1.json', vaultRoot), 'utf8'));
++  const plaintext = new Uint8Array(Buffer.from(vector.plaintext_base64, 'base64'));
++  const encrypted = await encryptTendies(plaintext);
++  const deps = fakeDependencies();
++  const register = createPackageHandler('register', deps);
++  const registrationResponse = await register(request({
++    package_id: encrypted.packageId, sha256: encrypted.sha256,
++    key_base64: base64(encrypted.keyBytes), original_name: 'Interop.tendies', requires_vip: true,
++  }));
++  assert.equal(registrationResponse.status, 201);
++  assert.deepEqual(await registrationResponse.json(), { package_id: encrypted.packageId, sha256: encrypted.sha256 });
++  deps.state.record = { ...deps.state.inserts[0], active: true };
++  assert.equal(deps.state.record.key_base64, undefined);
++  assert.notEqual(deps.state.record.wrapped_key, base64(encrypted.keyBytes));
++  // The browser does not retain a plaintext content key after registration.
++  encrypted.keyBytes.fill(0);
++
++  const recipient = clientRecipient();
++  const body = { package_id: encrypted.packageId, sha256: encrypted.sha256, public_key: recipient.public_key };
++  const release = createPackageHandler('key', deps);
++  assert.equal((await release(request(body))).status, 403); // No active VIP yet.
++  deps.state.vip = { plan_id: 'lifetime', vip_expires_at: null };
++  const releaseResponse = await release(request(body));
++  assert.equal(releaseResponse.status, 200);
++  const wrapped = await releaseResponse.json();
++  const contentKey = recipient.unwrap(wrapped, encrypted.packageId);
++  assert.throws(() => clientRecipient().unwrap(wrapped, encrypted.packageId));
++  assert.equal(createHash('sha256').update(encrypted.bytes).digest('hex'), encrypted.sha256);
++
++  function decryptPayload(bytes) {
++    const decrypt = createDecipheriv('aes-256-gcm', contentKey, bytes.subarray(24, 36));
++    decrypt.setAAD(bytes.subarray(0, 24));
++    decrypt.setAuthTag(bytes.subarray(-16));
++    return Buffer.concat([decrypt.update(bytes.subarray(36, -16)), decrypt.final()]);
++  }
++  assert.deepEqual(decryptPayload(encrypted.bytes), Buffer.from(plaintext));
++  for (const position of [8, 24, 36, encrypted.bytes.length - 1]) {
++    const tampered = new Uint8Array(encrypted.bytes);
++    tampered[position] ^= 1;
++    assert.throws(() => decryptPayload(tampered));
++    const changedHash = createHash('sha256').update(tampered).digest('hex');
++    assert.equal((await release(request({ ...body, sha256: changedHash }))).status, 404);
++  }
++  deps.state.record.active = false;
++  assert.equal((await release(request(body))).status, 404);
++  contentKey.fill(0);
++});
+--- /dev/null
++++ b/Dynor-iOS/Tools/DynorVault/README.md
+@@ -0,0 +1,5 @@
++# Dynor Vault
++
++Công cụ web mã hóa `.tendies` thành `.dynor`. Mở bản hosted tại https://dynor-vault.amberstingray1.chatgpt.site hoặc phục vụ thư mục `dist/` qua HTTPS. Cần triển khai SQL và Edge Functions theo `../../ENCRYPTED_TENDIES_SETUP.md` trước khi đăng ký gói. Không có khóa nội dung hoặc KEK production trong source.
++
++Kiểm tra JavaScript: `npm run check`. Kiểm thử crypto: `node --test --test-isolation=none tests/*.test.mjs` (Node 24). Fixture trong `tests/` chứa khóa công khai chỉ dành cho kiểm thử.
+--- /dev/null
++++ b/Dynor-iOS/Tools/DynorVault/dist/app.mjs
+@@ -0,0 +1,259 @@
++import { encryptTendies, validateTendiesFile, outputFilename, toBase64 } from './crypto.mjs';
++
++const SUPABASE_URL = 'https://wkivekbodwbinmvargts.supabase.co';
++const PUBLIC_KEY = 'sb_publishable_7eP5C7X8t6ip2ntFANmGJQ_K1Mybu2m';
++const element = id => document.getElementById(id);
++const ui = Object.fromEntries(['drop-zone', 'file-input', 'selected-file', 'file-name', 'file-size', 'clear-file', 'vip-toggle', 'access-description', 'encrypt-button', 'action-hint', 'operation-status', 'status-text', 'result-panel', 'result-name', 'download-link', 'email-input', 'send-code', 'otp-panel', 'otp-input', 'verify-code', 'login-panel', 'signed-in', 'signed-in-email', 'logout-button', 'auth-status', 'account-state'].map(id => [id, element(id)]));
++let selectedFile = null;
++let session = null;
++let pendingEmail = '';
++let busy = false;
++let authBusy = false;
++let expiryTimer = null;
++let downloadURL = null;
++const supportsCrypto = Boolean(window.isSecureContext && window.crypto?.subtle);
++
++function authMessage(message, error = false) {
++  ui['auth-status'].textContent = message;
++  ui['auth-status'].classList.toggle('error', error);
++}
++
++function operationMessage(message, { error = false, working = false } = {}) {
++  ui['operation-status'].hidden = !message;
++  ui['status-text'].textContent = message;
++  ui['operation-status'].classList.toggle('error', error);
++  ui['operation-status'].classList.toggle('busy', working);
++}
++
++function clearDownload() {
++  if (downloadURL) URL.revokeObjectURL(downloadURL);
++  downloadURL = null;
++  ui['download-link'].removeAttribute('href');
++  ui['download-link'].removeAttribute('download');
++  ui['result-panel'].hidden = true;
++  ui['result-name'].textContent = '';
++}
++
++function sessionIsValid() {
++  return Boolean(session && session.expiresAt > Date.now());
++}
++
++function updateControls() {
++  const valid = sessionIsValid();
++  ui['encrypt-button'].disabled = !supportsCrypto || !valid || !selectedFile || busy || authBusy;
++  ui['file-input'].disabled = busy;
++  ui['clear-file'].disabled = busy;
++  ui['vip-toggle'].disabled = busy;
++  ui['logout-button'].disabled = busy || authBusy;
++  ui['send-code'].disabled = busy || authBusy;
++  ui['verify-code'].disabled = busy || authBusy;
++  ui['email-input'].disabled = busy || authBusy;
++  ui['otp-input'].disabled = busy || authBusy;
++  document.body.classList.toggle('busy', busy);
++  ui['encrypt-button'].setAttribute('aria-busy', String(busy));
++  ui['encrypt-button'].querySelector('span').textContent = busy ? 'Đang tạo gói bảo vệ…' : 'Mã hóa và tạo gói';
++  if (!supportsCrypto) ui['action-hint'].textContent = 'Cần Safari hoặc Chrome mới nhất qua kết nối HTTPS.';
++  else if (busy) ui['action-hint'].textContent = 'Giữ trang này mở cho đến khi gói sẵn sàng.';
++  else if (!valid) ui['action-hint'].textContent = 'Đăng nhập quản trị và chọn file để bắt đầu.';
++  else if (!selectedFile) ui['action-hint'].textContent = 'Chọn file .tendies của bạn để tiếp tục.';
++  else ui['action-hint'].textContent = 'Khóa được đăng ký trước khi bạn tải gói mã hóa.';
++}
++
++function clearSession(message = '') {
++  session = null;
++  clearTimeout(expiryTimer);
++  expiryTimer = null;
++  ui['login-panel'].hidden = false;
++  ui['signed-in'].hidden = true;
++  ui['signed-in-email'].textContent = '';
++  ui['account-state'].textContent = 'Chưa kết nối';
++  ui['account-state'].classList.remove('connected');
++  ui['otp-input'].value = '';
++  ui['otp-panel'].hidden = true;
++  clearDownload();
++  authMessage(message);
++  updateControls();
++}
++
++async function api(path, { token, payload, method = 'POST' } = {}) {
++  const headers = { apikey: PUBLIC_KEY, 'Content-Type': 'application/json' };
++  if (token) headers.Authorization = `Bearer ${token}`;
++  let response;
++  try {
++    response = await fetch(`${SUPABASE_URL}/${path}`, { method, headers, body: payload === undefined ? undefined : JSON.stringify(payload), cache: 'no-store', credentials: 'omit', referrerPolicy: 'no-referrer', redirect: 'error' });
++  } catch {
++    throw new Error(path.startsWith('functions/') ? 'Chưa kết nối được dịch vụ mã hóa. Kiểm tra mạng và hoàn tất Hướng dẫn thiết lập trước khi tạo gói.' : 'Không kết nối được Dynor. Hãy kiểm tra mạng và thử lại.');
++  }
++  let data;
++  try { data = await response.json(); } catch { data = null; }
++  if (!response.ok) {
++    if (path.startsWith('functions/')) {
++      if (response.status === 401) { clearSession(); throw new Error('Phiên đăng nhập đã hết hạn. Hãy đăng nhập lại.'); }
++      if (response.status === 403) throw new Error('Tài khoản chưa có quyền quản trị để tạo gói bảo vệ.');
++      if (response.status === 404 || response.status >= 500) throw new Error('Dịch vụ mã hóa chưa sẵn sàng. Hoàn tất Hướng dẫn thiết lập hoặc kiểm tra cấu hình server. Chưa tạo file tải xuống.');
++      if (response.status === 429) throw new Error('Bạn thao tác quá nhanh. Hãy chờ một lát rồi thử lại.');
++      throw new Error('Chưa đăng ký được gói bảo vệ. Kiểm tra cấu hình server rồi thử lại; chưa có file nào được tải xuống.');
++    }
++    if (path === 'rest/v1/rpc/dynor_is_admin') throw new Error('Chưa xác minh được quyền quản trị. Kiểm tra cấu hình Dynor và quyền tài khoản.');
++    if (response.status === 429) throw new Error('Đã gửi nhiều yêu cầu. Hãy chờ một lát trước khi thử lại.');
++    if (path === 'auth/v1/verify') throw new Error('Mã đăng nhập không đúng hoặc đã hết hạn. Hãy kiểm tra email hoặc nhận mã mới.');
++    throw new Error('Chưa gửi được mã đăng nhập. Kiểm tra email và cấu hình đăng nhập Dynor.');
++  }
++  return data;
++}
++
++ui['send-code'].addEventListener('click', async () => {
++  if (authBusy || busy) return;
++  const email = ui['email-input'].value.trim().toLowerCase();
++  if (!ui['email-input'].checkValidity() || !email) {
++    authMessage('Nhập địa chỉ email Dynor hợp lệ.', true);
++    ui['email-input'].focus();
++    return;
++  }
++  authBusy = true;
++  authMessage('Đang gửi mã đăng nhập…');
++  updateControls();
++  try {
++    await api('auth/v1/otp', { payload: { email, create_user: false } });
++    pendingEmail = email;
++    ui['otp-panel'].hidden = false;
++    ui['otp-input'].value = '';
++    authMessage('Đã yêu cầu mã đăng nhập. Kiểm tra hộp thư và mục thư rác.');
++  } catch (error) { authMessage(error.message, true); }
++  finally {
++    authBusy = false;
++    updateControls();
++    if (!ui['otp-panel'].hidden) ui['otp-input'].focus();
++  }
++});
++
++ui['verify-code'].addEventListener('click', async () => {
++  if (authBusy || busy) return;
++  const code = ui['otp-input'].value.trim();
++  if (!pendingEmail || !/^\d{6,10}$/.test(code)) { authMessage('Nhập mã xác nhận được gửi tới email của bạn.', true); return; }
++  authBusy = true;
++  authMessage('Đang xác minh tài khoản…');
++  updateControls();
++  try {
++    const data = await api('auth/v1/verify', { payload: { email: pendingEmail, token: code, type: 'email' } });
++    if (!data || typeof data.access_token !== 'string' || !Number.isFinite(data.expires_in) || data.expires_in <= 0) throw new Error('Phiên đăng nhập không hợp lệ. Hãy nhận mã mới.');
++    const admin = await api('rest/v1/rpc/dynor_is_admin', { token: data.access_token, payload: {} });
++    if (admin !== true) throw new Error('Tài khoản này chưa được cấp quyền quản trị Dynor.');
++    session = { token: data.access_token, email: pendingEmail, expiresAt: Date.now() + data.expires_in * 1000 };
++    expiryTimer = setTimeout(() => clearSession('Phiên đăng nhập đã hết hạn. Hãy đăng nhập lại.'), Math.min(data.expires_in * 1000, 2_147_483_647));
++    ui['login-panel'].hidden = true;
++    ui['signed-in'].hidden = false;
++    ui['signed-in-email'].textContent = pendingEmail;
++    ui['account-state'].textContent = 'Đã kết nối';
++    ui['account-state'].classList.add('connected');
++    ui['otp-input'].value = '';
++    authMessage('Bạn có thể tạo gói bảo vệ ngay bây giờ.');
++    // Refresh tokens are deliberately not retained: this page keeps its session in memory only.
++    data.access_token = '';
++    data.refresh_token = '';
++  } catch (error) { clearSession(); authMessage(error.message, true); }
++  finally { authBusy = false; updateControls(); }
++});
++
++ui['logout-button'].addEventListener('click', async () => {
++  if (busy || authBusy) return;
++  const token = session?.token;
++  clearSession('Đã đăng xuất khỏi công cụ mã hóa.');
++  selectedFile = null;
++  ui['file-input'].value = '';
++  ui['selected-file'].hidden = true;
++  operationMessage('');
++  updateControls();
++  if (token) {
++    try { await api('auth/v1/logout?scope=local', { token, payload: {} }); } catch { /* Local credentials have already been discarded. */ }
++  }
++});
++
++function chooseFile(file) {
++  if (busy) return;
++  clearDownload();
++  operationMessage('');
++  try {
++    validateTendiesFile(file);
++    selectedFile = file;
++    ui['file-name'].textContent = file.name;
++    ui['file-size'].textContent = `${new Intl.NumberFormat('vi-VN', { maximumFractionDigits: 2 }).format(file.size / (1024 * 1024))} MB · Đã chọn`;
++    ui['selected-file'].hidden = false;
++  } catch (error) {
++    selectedFile = null;
++    ui['file-input'].value = '';
++    ui['selected-file'].hidden = true;
++    operationMessage(error.message, { error: true });
++  }
++  updateControls();
++}
++
++ui['file-input'].addEventListener('change', () => { if (ui['file-input'].files.length) chooseFile(ui['file-input'].files[0]); });
++ui['clear-file'].addEventListener('click', () => {
++  if (busy) return;
++  selectedFile = null;
++  ui['file-input'].value = '';
++  ui['selected-file'].hidden = true;
++  clearDownload();
++  operationMessage('');
++  updateControls();
++});
++ui['drop-zone'].addEventListener('keydown', event => { if (!busy && (event.key === 'Enter' || event.key === ' ')) { event.preventDefault(); ui['file-input'].click(); } });
++for (const name of ['dragenter', 'dragover']) ui['drop-zone'].addEventListener(name, event => { event.preventDefault(); if (!busy) ui['drop-zone'].classList.add('dragover'); });
++for (const name of ['dragleave', 'drop']) ui['drop-zone'].addEventListener(name, event => { event.preventDefault(); ui['drop-zone'].classList.remove('dragover'); });
++ui['drop-zone'].addEventListener('drop', event => {
++  if (busy) return;
++  if (event.dataTransfer.files.length !== 1) { operationMessage('Chọn một file Tendies cho mỗi lần mã hóa.', { error: true }); return; }
++  chooseFile(event.dataTransfer.files[0]);
++});
++ui['vip-toggle'].addEventListener('change', () => {
++  ui['access-description'].textContent = ui['vip-toggle'].checked ? 'Cần tài khoản Dynor có VIP còn hiệu lực.' : 'Mọi tài khoản Dynor đã đăng nhập đều có thể cài.';
++  clearDownload();
++  operationMessage('');
++});
++
++ui['encrypt-button'].addEventListener('click', async () => {
++  if (busy || authBusy || !selectedFile || !supportsCrypto) return;
++  if (!sessionIsValid()) { clearSession('Phiên đăng nhập đã hết hạn. Hãy đăng nhập lại.'); return; }
++  busy = true;
++  clearDownload();
++  updateControls();
++  let plaintext;
++  let encrypted;
++  let registration;
++  const source = selectedFile;
++  const requiresVip = ui['vip-toggle'].checked;
++  try {
++    operationMessage('Đang đọc hình nền trên thiết bị…', { working: true });
++    validateTendiesFile(source);
++    plaintext = new Uint8Array(await source.arrayBuffer());
++    operationMessage('Đang mã hóa hình nền…', { working: true });
++    encrypted = await encryptTendies(plaintext);
++    plaintext.fill(0);
++    plaintext = null;
++    operationMessage('Đang đăng ký khóa bảo vệ với Dynor…', { working: true });
++    registration = { package_id: encrypted.packageId, sha256: encrypted.sha256, key_base64: toBase64(encrypted.keyBytes), original_name: source.name, requires_vip: requiresVip };
++    const saved = await api('functions/v1/dynor-register-package', { token: session.token, payload: registration });
++    if (!saved || saved.package_id !== encrypted.packageId || saved.sha256 !== encrypted.sha256) throw new Error('Server chưa xác nhận đúng gói mã hóa. Chưa tạo file tải xuống; hãy kiểm tra dịch vụ rồi thử lại.');
++    const filename = outputFilename(source.name);
++    downloadURL = URL.createObjectURL(new Blob([encrypted.bytes], { type: 'application/octet-stream' }));
++    ui['download-link'].href = downloadURL;
++    ui['download-link'].download = filename;
++    ui['result-name'].textContent = filename;
++    ui['result-panel'].hidden = false;
++    operationMessage('Đã mã hóa và đăng ký khóa thành công. Bạn có thể tải gói bảo vệ.');
++  } catch (error) {
++    clearDownload();
++    operationMessage(error.message || 'Chưa tạo được gói bảo vệ. Hãy thử lại.', { error: true });
++  } finally {
++    plaintext?.fill(0);
++    encrypted?.keyBytes.fill(0);
++    if (registration) registration.key_base64 = '';
++    busy = false;
++    updateControls();
++  }
++});
++
++ui['download-link'].addEventListener('click', event => { if (!downloadURL) event.preventDefault(); });
++window.addEventListener('pagehide', () => { clearDownload(); session = null; clearTimeout(expiryTimer); });
++updateControls();
+--- /dev/null
++++ b/Dynor-iOS/Tools/DynorVault/dist/crypto.mjs
+@@ -0,0 +1,80 @@
++export const MAGIC = 'DYNORT01';
++export const MAX_TENDIES_BYTES = 50 * 1024 * 1024;
++const encoder = new TextEncoder();
++const UUID_PATTERN = /^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/i;
++
++export function validateTendiesFile(file) {
++  if (!file || typeof file.name !== 'string' || !/\.tendies$/i.test(file.name)) {
++    throw new Error('Hãy chọn một tệp có đuôi .tendies.');
++  }
++  if (!Number.isSafeInteger(file.size) || file.size <= 0) {
++    throw new Error('Tệp trống hoặc không đọc được.');
++  }
++  if (file.size > MAX_TENDIES_BYTES) {
++    throw new Error('Tệp vượt quá giới hạn 50 MB.');
++  }
++  const name = file.name;
++  if (name.length < 9 || [...name].length > 255 || name.trim() !== name || /[\u0000-\u001f\u007f/\\]/.test(name)) {
++    throw new Error('Tên tệp không hợp lệ hoặc dài hơn 255 ký tự.');
++  }
++  return true;
++}
++
++export function buildHeader(packageId) {
++  if (typeof packageId !== 'string' || !UUID_PATTERN.test(packageId)) {
++    throw new Error('Mã gói không hợp lệ.');
++  }
++  const header = new Uint8Array(24);
++  header.set(encoder.encode(MAGIC));
++  const hex = packageId.replaceAll('-', '');
++  for (let index = 0; index < 16; index += 1) {
++    header[index + 8] = Number.parseInt(hex.slice(index * 2, index * 2 + 2), 16);
++  }
++  return header;
++}
++
++export function outputFilename(name) {
++  const basename = String(name).split(/[\\/]/).pop().replace(/\.tendies$/i, '');
++  return `${basename || 'wallpaper'}.dynor`;
++}
++
++export function toBase64(bytes) {
++  let binary = '';
++  for (const byte of bytes) binary += String.fromCharCode(byte);
++  return btoa(binary);
++}
++
++export async function encryptTendies(input, options = {}) {
++  const bytes = input instanceof Uint8Array ? input : new Uint8Array(input);
++  if (bytes.byteLength < 4 || bytes.byteLength > MAX_TENDIES_BYTES) {
++    throw new Error(bytes.byteLength > MAX_TENDIES_BYTES ? 'Tệp vượt quá giới hạn 50 MB.' : 'Tệp Tendies không hợp lệ.');
++  }
++  const localHeader = bytes[2] === 0x03 && bytes[3] === 0x04;
++  const emptyZipHeader = bytes[2] === 0x05 && bytes[3] === 0x06;
++  if (bytes[0] !== 0x50 || bytes[1] !== 0x4b || (!localHeader && !emptyZipHeader)) {
++    throw new Error('Tệp không có cấu trúc gói Tendies hợp lệ.');
++  }
++  if (!globalThis.crypto?.subtle) throw new Error('Trình duyệt này chưa hỗ trợ mã hóa an toàn. Hãy dùng Safari hoặc Chrome mới nhất qua HTTPS.');
++  const packageId = (options.packageId ?? crypto.randomUUID()).toLowerCase();
++  const header = buildHeader(packageId);
++  const keyBytes = options.keyBytes ? new Uint8Array(options.keyBytes) : crypto.getRandomValues(new Uint8Array(32));
++  const nonce = options.nonce ? new Uint8Array(options.nonce) : crypto.getRandomValues(new Uint8Array(12));
++  if (keyBytes.byteLength !== 32 || nonce.byteLength !== 12) {
++    keyBytes.fill(0);
++    throw new Error('Thông số mã hóa không hợp lệ.');
++  }
++  try {
++    const key = await crypto.subtle.importKey('raw', keyBytes, { name: 'AES-GCM' }, false, ['encrypt']);
++    const ciphertext = new Uint8Array(await crypto.subtle.encrypt({ name: 'AES-GCM', iv: nonce, additionalData: header, tagLength: 128 }, key, bytes));
++    const encrypted = new Uint8Array(header.length + nonce.length + ciphertext.length);
++    encrypted.set(header);
++    encrypted.set(nonce, header.length);
++    encrypted.set(ciphertext, header.length + nonce.length);
++    const digest = new Uint8Array(await crypto.subtle.digest('SHA-256', encrypted));
++    const sha256 = Array.from(digest, byte => byte.toString(16).padStart(2, '0')).join('');
++    return { bytes: encrypted, packageId, sha256, keyBytes };
++  } catch (error) {
++    keyBytes.fill(0);
++    throw error;
++  }
++}
+--- /dev/null
++++ b/Dynor-iOS/Tools/DynorVault/dist/index.html
+@@ -0,0 +1,53 @@
++<!doctype html>
++<html lang="vi">
++<head>
++  <meta charset="utf-8">
++  <meta name="viewport" content="width=device-width, initial-scale=1">
++  <meta name="theme-color" content="#102c29">
++  <meta name="description" content="Mã hóa hình nền Tendies của bạn thành gói bảo vệ dành cho Dynor.">
++  <meta name="robots" content="noindex, nofollow">
++  <meta name="referrer" content="no-referrer">
++  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self'; connect-src 'self' https://wkivekbodwbinmvargts.supabase.co; img-src 'self' data:; object-src 'none'; base-uri 'none'; form-action 'none'">
++  <title>Dynor Vault · Mã hóa hình nền</title>
++  <link rel="stylesheet" href="styles.css">
++  <script type="module" src="app.mjs"></script>
++</head>
++<body>
++  <div class="app-shell">
++    <aside class="sidebar">
++      <a class="brand" href="./" aria-label="Dynor Vault, trang chính"><span class="brand-mark" aria-hidden="true">D<span></span></span><span>dynor<span class="brand-subtitle">VAULT</span></span></a>
++      <div class="sidebar-main">
++        <div class="eyebrow sidebar-label">KHÔNG GIAN NHÀ SÁNG TẠO</div>
++        <a class="side-link active" href="#encrypt"><svg aria-hidden="true" viewBox="0 0 24 24"><rect x="5" y="10" width="14" height="11" rx="3"/><path d="M8 10V7a4 4 0 0 1 8 0v3M12 14v3"/></svg>Mã hóa hình nền<span class="active-dot"></span></a>
++        <a class="side-link" href="#how-it-works"><svg aria-hidden="true" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M12 11v6M12 7h.01"/></svg>Cách sử dụng</a>
++        <div class="sidebar-note"><span class="small-shield" aria-hidden="true">◇</span><p>Thiết kế cho nội dung<br>do chính bạn tạo ra.</p><div class="note-rule"></div><p class="sidebar-note-secondary">Một gói bảo vệ.<br>Một trải nghiệm Dynor.</p></div>
++      </div>
++      <div class="sidebar-footer"><span class="connection-dot"></span>Xử lý file trên thiết bị của bạn</div>
++    </aside>
++    <div class="content-shell">
++      <header class="topbar"><span>Hình nền của bạn, được bảo vệ.</span><span class="private-badge"><svg aria-hidden="true" viewBox="0 0 24 24"><path d="m12 3 8 3v6c0 4-5 8-8 9-3-1-8-5-8-9V6l8-3Z"/><path d="m8 12 3 3 5-6"/></svg>Dành cho quản trị viên</span></header>
++      <main>
++        <section class="intro" aria-labelledby="page-title"><div><div class="eyebrow">DYNOR VAULT / CÔNG CỤ MÃ HÓA</div><h1 id="page-title">Bảo vệ từng<br><em>chuyển động.</em></h1><p>Biến hình nền Tendies của bạn thành gói mã hóa.<br>Người dùng mở và cài trực tiếp trong Dynor.</p></div><div class="intro-art" aria-hidden="true"><div class="art-orbit orbit-one"></div><div class="art-orbit orbit-two"></div><div class="art-folder folder-back"></div><div class="art-folder folder-front"><svg viewBox="0 0 24 24"><rect x="6" y="10" width="12" height="10" rx="3"/><path d="M9 10V7a3 3 0 0 1 6 0v3M12 14v2"/></svg><span>.dynor</span></div><span class="art-star">✦</span></div></section>
++        <div class="workspace" id="encrypt">
++          <section class="card encrypt-card" aria-labelledby="encrypt-title">
++            <div class="card-heading"><div><span class="section-number">01</span><h2 id="encrypt-title">Tạo gói bảo vệ</h2></div><span class="format-badge">.tendies → .dynor</span></div>
++            <label class="drop-zone" id="drop-zone" for="file-input" tabindex="0"><input id="file-input" type="file" accept=".tendies" class="visually-hidden"><span class="upload-icon"><svg aria-hidden="true" viewBox="0 0 24 24"><path d="M12 16V4m-5 5 5-5 5 5M4 15v4a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-4"/></svg></span><strong>Chọn hình nền Tendies</strong><span>Kéo thả file vào đây hoặc <span class="text-link">chọn từ thiết bị</span></span><span class="drop-caption">Một file .tendies · Tối đa 50 MB</span></label>
++            <div class="selected-file" id="selected-file" hidden><span class="file-icon" aria-hidden="true">T</span><div><strong id="file-name"></strong><span id="file-size"></span></div><button type="button" class="icon-button" id="clear-file" aria-label="Bỏ chọn file">×</button></div>
++            <div class="settings-block"><div class="settings-title">QUYỀN CÀI ĐẶT</div><label class="access-option" for="vip-toggle"><span class="access-icon" aria-hidden="true">✦</span><span><strong>Chỉ dành cho VIP</strong><small id="access-description">Cần tài khoản Dynor có VIP còn hiệu lực.</small></span><span class="switch"><input type="checkbox" id="vip-toggle" checked><span class="switch-track"></span></span></label></div>
++            <button type="button" class="primary-button" id="encrypt-button" disabled><svg aria-hidden="true" viewBox="0 0 24 24"><rect x="5" y="10" width="14" height="11" rx="3"/><path d="M8 10V7a4 4 0 0 1 8 0v3M12 14v3"/></svg><span>Mã hóa và tạo gói</span><svg class="button-arrow" aria-hidden="true" viewBox="0 0 24 24"><path d="M5 12h14m-6-6 6 6-6 6"/></svg></button>
++            <p class="action-hint" id="action-hint">Đăng nhập quản trị và chọn file để bắt đầu.</p>
++            <div class="operation-status" id="operation-status" role="status" aria-live="polite" hidden><span class="status-dot"></span><span id="status-text"></span></div>
++            <div class="result-panel" id="result-panel" hidden><span class="result-check" aria-hidden="true">✓</span><div><strong>Gói của bạn đã sẵn sàng.</strong><p id="result-name"></p></div><a id="download-link" class="download-button">Tải gói .dynor<svg aria-hidden="true" viewBox="0 0 24 24"><path d="M12 4v12m-5-5 5 5 5-5M5 19h14"/></svg></a></div>
++            <div class="privacy-note"><svg aria-hidden="true" viewBox="0 0 24 24"><path d="m12 3 8 3v6c0 4-5 8-8 9-3-1-8-5-8-9V6l8-3Z"/><path d="m8 12 3 3 5-6"/></svg><p>File gốc được mã hóa ngay trong trình duyệt và không tải lên server. Chỉ khóa của gói được gửi đến dịch vụ bảo vệ Dynor.</p></div>
++          </section>
++          <aside class="right-column">
++            <section class="card account-card" aria-labelledby="account-title"><div class="card-heading"><div><span class="section-number">02</span><h2 id="account-title">Tài khoản quản trị</h2></div><span class="account-state" id="account-state">Chưa kết nối</span></div><p class="account-copy">Dùng tài khoản quản trị Dynor để đăng ký khóa và tạo gói mã hóa.</p><div id="login-panel"><label class="field-label" for="email-input">Email Dynor</label><input id="email-input" class="text-input" type="email" inputmode="email" autocomplete="email" placeholder="ban@email.com" maxlength="254"><button id="send-code" class="secondary-button" type="button">Nhận mã đăng nhập<svg aria-hidden="true" viewBox="0 0 24 24"><path d="M5 12h14m-6-6 6 6-6 6"/></svg></button><div id="otp-panel" hidden><label class="field-label" for="otp-input">Mã xác nhận trong email</label><input id="otp-input" class="text-input otp-input" type="text" inputmode="numeric" autocomplete="one-time-code" placeholder="Nhập mã xác nhận" maxlength="10"><button id="verify-code" class="secondary-button" type="button">Xác nhận đăng nhập</button></div></div><div class="signed-in" id="signed-in" hidden><span class="user-avatar" aria-hidden="true">D</span><div><strong>Đã xác minh quản trị</strong><span id="signed-in-email"></span></div><button id="logout-button" class="text-button" type="button">Đăng xuất</button></div><p id="auth-status" class="auth-status" role="status" aria-live="polite"></p></section>
++            <section class="workflow-card" id="how-it-works" aria-labelledby="workflow-title"><div class="eyebrow">TỪ FILE GỐC ĐẾN HÌNH NỀN</div><h2 id="workflow-title">Ba bước. Hoàn tất.</h2><ol class="workflow"><li><span>1</span><div><strong>Chọn & mã hóa</strong><p>Tạo gói .dynor từ hình nền .tendies của bạn.</p></div></li><li><span>2</span><div><strong>Chia sẻ gói bảo vệ</strong><p>Đăng lên thư viện Dynor hoặc gửi file .dynor cho người dùng.</p></div></li><li><span>3</span><div><strong>Mở trong Dynor</strong><p>Đăng nhập, có kết nối mạng và chọn Cài hình nền.</p></div></li></ol><div class="workflow-footer"><svg aria-hidden="true" viewBox="0 0 24 24"><path d="M9 12h6m-3-3v6M7 3h10a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2Z"/></svg>Dynor không xuất file Tendies đã giải mã.</div></section>
++          </aside>
++        </div>
++        <footer class="page-footer"><span>© Dynor · Nội dung thuộc về người sáng tạo.</span><span>Không bảo đảm chống trích xuất trên thiết bị đã bị can thiệp. <a href="setup.html">Hướng dẫn thiết lập</a></span></footer>
++      </main>
++    </div>
++  </div>
++</body>
++</html>
+--- /dev/null
++++ b/Dynor-iOS/Tools/DynorVault/dist/setup-files/VERIFICATION.md
+@@ -0,0 +1,70 @@
++# Bản sửa 1.2.2 (build 5) — nhập pairing
++
++Chỉ rà soát mã; môi trường sửa không có Swift/Xcode nên **chưa compile, chưa chạy XCTest, chưa thử trên iPhone**. Đã thêm 3 test: picker pairing nhận `.plist`/UTI dynamic/mọi tài liệu, tệp pairing không đuôi, tệp pairing bị thêm `.txt`. Cần kiểm tra trên máy: nhập `pairingFile.plist`, `*.mobiledevicepairing`, tệp không đuôi từ Tệp (On My iPhone, iCloud Drive, SideStore/LiveContainer), mở lại ứng dụng và xác nhận bản sao còn dùng được.
++
++# Kiểm chứng bản sửa 1.2.1 (build 4)
++
++## Đã kiểm tra trong môi trường Linux
++
++- Tải mã nguồn công khai AirCard; HEAD là `40640c4d827aeab8d798285b57d24fcf6be070d0`, trùng revision đã ghim trong Dynor. Đối chiếu luồng Tendies, cấu trúc PosterBoard, chữ ký FFI và cách chọn địa chỉ mạng với upstream.
++- Đủ 7 tệp AirliftFFI được xác minh SHA-256 theo `ThirdParty/AirCard/provenance.json`. Chạy `scripts/prepare_airlift.py` với bộ framework này xác minh đủ hash và bỏ qua tải lại.
++- Parser tree-sitter Swift kiểm tra **23 tệp Swift**, không có node lỗi hoặc thiếu cú pháp. Đây là kiểm tra cú pháp, không phải Swift typecheck, compile hay link.
++- Đối chiếu picker với AirCard: dùng native copy-based picker, nhận mọi UTI cho đuôi Tendies và ZIP/archive/data. Parse `project.yml` xác nhận hai UTI Tendies, archive/ZIP conformance, vai trò Viewer và phiên bản 1.2.1/build 4. Chưa kiểm tra thao tác chọn tệp trên iPhone.
++- **6 kiểm thử Python** trong `scripts/test_prepare_airlift.py` đạt: tải/khôi phục framework, hash sai, thiếu member và giới hạn dung lượng.
++- Parse YAML của `project.yml`, `codemagic.yaml` và `.github/workflows/build-ipa.yml`; kiểm tra các khối shell bằng `bash -n`; parse các Python helper bằng `ast.parse`: đạt.
++- Rà soát thủ công vòng đời C-string khi cấu hình Airlift: Rust sao chép chuỗi đồng bộ; Swift giữ bộ nhớ tới khi hai lời gọi cấu hình hoàn tất. Địa chỉ loopback, interface tunnel và interface không hoạt động không được thêm làm ứng viên thiết bị.
++
++Các kiểm tra trên không xác nhận việc cài hình nền thành công trên iPhone.
++
++## XCTest đã có, chưa chạy trong Linux
++
++**33 phương thức kiểm thử** trong `DynorTests/`:
++
++- 7 test import: giữ nguyên byte/name `.tendies`, tệp rỗng/thư mục, giới hạn dung lượng, pairing XML/binary, dữ liệu plist không hợp lệ, từ chối URL web, tên provider/URL tạm không làm mất đuôi tệp.
++- 3 test loại tài liệu: picker nhận các UTI Dynor/AirCard và mọi UTI Tendies đã đăng ký, có các fallback provider, Info.plist của app khai báo mở tệp bằng cả hai UTI với vai trò Viewer.
++- 7 test archive: CRC, traversal/absolute/Windows paths, symlink/case collision, local header lệch/truncated ZIP, dung lượng/encryption, thiếu/dư tệp sau giải nén, bounded DEFLATE và kích thước khai báo sai.
++- 6 test descriptor: tên extension cũ/mới hai chiều, gói full container, bỏ metadata macOS, không lấy nhầm tên thư mục ngoài archive, giữ suggestion metadata, đồng bộ identifier số và giữ identifier ký hiệu, từ chối descriptor rỗng.
++- 4 test địa chỉ mạng: Wi-Fi đứng trước các interface khác, loại loopback/tunnel, loại địa chỉ sai/interface tắt, fallback và loại trùng.
++- 6 test compatibility: iOS 18–27.1 được phép thử; iOS thấp hơn minimum bị chặn; iOS 27.2.0 chỉ mở cài khi người dùng chọn beta 1/2; beta 3+/RC/chính thức bị chặn; chọn beta không mở được 27.2.1+/bản tương lai; điều kiện ghép nối tách khỏi điều kiện cài.
++
++Workflow GitHub Actions/Codemagic chạy XCTest trên iPhone Simulator arm64 trước khi archive IPA. Cần lần chạy macOS thành công để xác nhận compile, link và kết quả XCTest; log và test results được lưu thành artifact.
++
++## Cần kiểm tra trên iPhone đích
++
++Ghi lại model máy, phiên bản iOS và build thực tế khi kiểm tra. Việc app cho phép thử cài chưa chứng minh từng beta đã hoạt động.
++
++| Nhóm phiên bản | Cần xác nhận |
++| --- | --- |
++| iOS 18–26.x, đặc biệt iOS 26 mà người dùng yêu cầu | Nhập pairing của chính thiết bị; không có ghép nối tại chỗ; cài và chọn Tendies qua Màn hình khóa. |
++| iOS 27.0 developer beta 1, 2, 3, 4 | Kiểm tra riêng từng beta: phiên bản/build, nhập pairing hoặc PIN trong Cài đặt, kết nối LocalDevVPN, cài descriptor và chọn hình nền. |
++| iOS 27.0 public beta 1, 2 | Kiểm tra riêng từng public beta với cùng quy trình, không suy ra kết quả từ developer beta. |
++| iOS 27.1 | Ghép nối, cài và chọn hình nền; chưa có kiểm chứng thiết bị trong môi trường sửa mã. |
++| iOS 27.2 beta 1 và beta 2 | Khi chưa chọn bản beta thì cài bị khóa. Chọn đúng beta đang dùng mở khả năng thử cài; kiểm tra native write và kết quả trong Màn hình khóa riêng trên mỗi build. |
++| iOS 27.2 beta 3+, RC, bản chính thức, 27.2.1+, bản tương lai | Cài bị khóa; chọn nhãn beta không được mở cài cho point release/bản tương lai. Không cần thực hiện native write để kiểm tra nhánh bị chặn. |
++
++Các luồng cần kiểm tra cùng phiên bản đích:
++
++- Nhập `.tendies` từ Tệp local và iCloud chưa tải; tên có chữ hoa trong extension; nhà cung cấp tài liệu khác nhau. Thử khi có/không cài AirCard cùng máy: tệp phải chọn được, “Chia sẻ → Dynor” xuất hiện. Hủy hoặc vuốt đóng picker rồi mở lại; nhập một/nhiều tệp và kiểm tra chuyển sheet sang màn hình xem trước.
++- Từ Khám phá, tải `.tendies` và ảnh qua **Tải và mở trong Dynor**: thêm vào Thư viện và mở ngay màn hình xem trước. Định dạng khác phải báo không hỗ trợ, không mở bảng chia sẻ và được dọn khỏi thư mục tải tạm. Kiểm tra đăng nhập/VIP theo quyền nội dung hiện có.
++- Mở gói Tendies từ Thư viện hoặc Khám phá: không có nút chia sẻ/xuất gói, vẫn có thể cài hình nền. Mở ảnh: vẫn lưu vào Photos và chia sẻ ảnh gốc được.
++- Import `pairingFile.plist` và `rp_pairing_file.plist` thật; đóng/mở lại Dynor và kiểm tra bản sao còn dùng được, file gốc giữ nguyên. Trên iOS 27, thử ghép nối PIN thành công, hủy, từ chối quyền Mạng cục bộ và thử lại.
++- Bật LocalDevVPN và mở khóa máy: tìm PosterBoard container, ghi các descriptor Collections/Mercury theo tên cũ/mới, cập nhật preferences, chọn wallpaper trong Màn hình khóa. Thử Wi-Fi bật/tắt và cấu hình VPN tương thích. Ngắt VPN hoặc dùng pairing sai phải báo lỗi.
++- Kiểm tra gói full container, descriptor đơn, suggestion metadata và identifier ký hiệu. Gói hỏng hoặc không có descriptor phải bị từ chối trước khi ghi.
++- Kiểm tra nhánh lỗi sau khi ghi một phần: báo chưa hoàn tất; khóa đổi/xóa pairing, xóa hình nền và mở tệp khác trong lượt cài. Hoàn tất hoặc lỗi phải khôi phục trạng thái nút và tự khóa màn hình như trước lượt cài.
++- Kiểm tra viền danh mục, chế độ sáng/tối, cỡ chữ lớn. Ảnh thông thường: cấp/từ chối quyền Photos, lưu và đặt làm hình nền qua giao diện hệ thống.
++
++Môi trường này không có Swift compiler, Xcode, iOS Simulator hoặc iPhone: **chưa build IPA, chưa thực thi XCTest, chưa xác nhận handshake hoặc cài hình nền trên thiết bị**. Dynor không tự respring hoặc tự chọn thay màn hình khóa. Upstream chưa cung cấp allowlist build beta; lựa chọn beta 1/2 ở iOS 27.2 là người dùng báo phiên bản đang dùng, không phải xác minh build tự động.
++
++## Framework và build
++
++- `project.yml` giữ `options.preGenCommand: python3 scripts/prepare_airlift.py --source-root .`. XcodeGen sẽ tải framework đã ghim và xác minh 7 SHA-256 khi source chưa có `Frameworks/`; nếu đã đủ bộ đúng hash thì bỏ qua tải lại.
++- Gói tải nhẹ có thể bỏ `Frameworks/`; không bỏ `scripts/prepare_airlift.py` hoặc `ThirdParty/AirCard/provenance.json`. Cần mạng khi build lần đầu mà chưa có framework.
++- Kiểm tra tải/xác minh framework không thay thế XcodeGen, archive bằng Xcode hoặc thử trên thiết bị. Cần chạy lại GitHub Actions/Codemagic với source 1.2.1 để xác nhận IPA và cài bản mới để kiểm tra lỗi nhập tệp.
++# Kiểm chứng gói mã hóa Dynor — 2026-11-16
++
++- 12 kiểm thử Node backend đạt, gồm xác thực/admin/VIP, quota, trạng thái thu hồi, hash, giới hạn request và liên thông mã hóa trình duyệt → đăng ký → cấp khóa → giải mã bằng Node/OpenSSL độc lập.
++- 9 kiểm thử crypto trình duyệt đạt, gồm vector AES-GCM độc lập, sửa header/nonce/ciphertext/tag, khóa sai, giới hạn dung lượng, UUID/nonce/khóa mới và tên file.
++- 26 tệp Swift phân tích cú pháp không có lỗi; YAML dự án hợp lệ. Đây không phải Swift typecheck hoặc build. 8 XCTest mới kiểm tra envelope, wrapper, dữ liệu bị sửa và tương thích model cũ; chưa thực thi do không có Xcode.
++- Bản mã `.dynor` nằm trong Thư viện; đường chia sẻ tệp chỉ dành cho ảnh. Bản rõ chỉ ở vùng cài tạm có bảo vệ; `defer` dọn sau thành công/lỗi và app dọn lại staging cũ lúc mở. Cần xác nhận trên iPhone cả nhánh thành công, lỗi, force-quit và khóa/mở khóa thiết bị.
++- Cần triển khai [ENCRYPTED_TENDIES_SETUP.md](ENCRYPTED_TENDIES_SETUP.md), chạy pipeline macOS và thử đăng nhập/quyền VIP, nhập qua Tệp/Khám phá, cài wallpaper thật. Chưa xác nhận luồng production hoặc thiết bị; hai endpoint mới hiện chưa được triển khai.
++
+--- /dev/null
++++ b/Dynor-iOS/Tools/DynorVault/dist/setup-files/WALLPAPER_ONLINE_SETUP.md
+@@ -0,0 +1,39 @@
++# Dynor Wallpaper Online — thiết lập trên iPhone
++
++## 1. Tạo bảng và Storage
++1. Safari → https://supabase.com/dashboard → project Login Dynor → SQL Editor → New query.
++2. Dán toàn bộ `Supabase/sql/wallpaper_online.sql` và nhấn Run **một lần**. Không chạy lại nguyên script nếu đã tạo policies.
++3. Authentication → Users → tìm tài khoản email quản trị của bạn → copy **User UID** (UUID).
++4. SQL Editor → New query → chạy lệnh bên dưới, thay UUID bằng UID thật của tài khoản bạn:
++   `insert into public.dynor_admins(user_id) values ('UUID-CUA-BAN') on conflict do nothing;`
++   Không cấp quyền quản trị cho UID của người khác.
++5. Storage → kiểm tra hai buckets `dynor-previews` (public) và `dynor-downloads` (private).
++
++## 2. Deploy Edge Function để tải file
++1. Edge Functions → Deploy a new function → tên `dynor-wallpaper-download`.
++2. Dán toàn bộ `Supabase/dynor-wallpaper-download/index.ts` rồi Deploy.
++3. Nếu cấu hình có tùy chọn `Verify JWT`, tắt kiểm tra JWT ở gateway **chỉ cho function này**, vì function tự xác minh JWT bằng `auth.getUser()`. Đảm bảo function vẫn yêu cầu Authorization Bearer hợp lệ.
++4. Supabase Edge Functions có sẵn `SUPABASE_URL`, `SUPABASE_ANON_KEY`, `SUPABASE_SERVICE_ROLE_KEY` trong nhiều project; nếu function báo thiếu cấu hình, thêm các biến qua Supabase Secrets. Không đặt service-role key trong app iOS hay website quản trị.
++
++## 3. Trang quản trị trên iPhone
++1. Tạo một GitHub Pages repo riêng, ví dụ `Dynor-Studio`.
++2. Upload `Admin/index.html` vào root repo, bật GitHub Pages → Deploy from branch → main/root.
++3. Mở website bằng Safari, đăng nhập OTP bằng email đã cấp quyền ở bước 1.
++4. Chọn ảnh bìa, video MP4 tùy chọn và file tải (JPG, PNG, `.tendies`, `.zip`, ...), rồi nhấn Đăng hình nền.
++5. Danh sách dưới form cho phép Ẩn/Hiện bài. File private không thể tải trực tiếp qua URL công khai.
++
++## 4. App iOS
++1. Build IPA bằng workflow/codemagic đang có trong project.
++2. Cài bản IPA mới **một lần** để nhận tính năng Online Gallery.
++3. Từ đó, đăng bài mới trên Dynor Studio không cần build lại IPA; app cập nhật khi mở tab hoặc kéo xuống.
++4. Thả tim yêu cầu đăng nhập; yêu thích lưu trong `dynor_favorites` theo `user_id`.
++5. Nút **Tải và mở trong Dynor** gọi Edge Function để xác minh phiên đăng nhập, trạng thái published và VIP rồi mới cấp URL riêng có hiệu lực 60 giây. Ảnh và `.tendies` tự thêm vào Thư viện rồi mở màn hình xem trước trong Dynor; các định dạng khác báo không hỗ trợ và được dọn khỏi thư mục tải tạm. App không xuất hoặc chia sẻ gói Tendies.
++6. Với `.tendies`, chọn **Cài hình nền** ngay trong màn hình vừa mở. Cần pairing của thiết bị và LocalDevVPN đang hoạt động; iOS 18–26 nhập file pairing, iOS 27 có thêm ghép nối trong Cài đặt. Sau khi cài, nhấn giữ màn hình khóa → Thêm hình nền để chọn mẫu mới. Xem phạm vi phiên bản và hướng dẫn chi tiết trong `README.md`.
++
++## Lưu ý
++- Chưa thể xác nhận build IPA thành công trên macOS trong môi trường này. Hãy chạy Codemagic và gửi log nếu gặp lỗi.
++- App hiện chỉ dùng Gallery online ở tab Khám phá; GalleryView.swift cũ được giữ nguyên làm mã nguồn dự phòng. Phần quảng cáo mô phỏng cũ không còn nằm trong tab Khám phá online.
++- Video MP4 cần định dạng được AVPlayer trên iOS hỗ trợ (nên dùng H.264/AAC).
++- Supabase Storage giới hạn kích thước tùy gói/cấu hình; nếu upload thất bại do giới hạn, cần điều chỉnh cấu hình hoặc tối ưu file.
++- Nếu dùng nội dung VIP trả phí trên App Store, cần kiểm tra quy định thanh toán Apple trước khi phát hành.
++- Với gói mã hóa `.dynor`, triển khai thêm SQL và hai Edge Function theo [ENCRYPTED_TENDIES_SETUP.md](ENCRYPTED_TENDIES_SETUP.md), rồi upload `.dynor` làm file tải về. Quyền VIP của gói và bài Gallery độc lập; muốn bảo vệ nội dung VIP phải bật cả hai.
+--- /dev/null
++++ b/Dynor-iOS/Tools/DynorVault/dist/setup-files/encrypted_packages.sql
+@@ -0,0 +1,96 @@
++-- Run after wallpaper_online.sql in the same Supabase project.
++-- Only Edge Functions with the service-role credential may access these tables.
++-- User JWTs, including administrator JWTs, never receive table access to keys.
++begin;
++
++create table if not exists public.dynor_encrypted_packages (
++  package_id uuid primary key,
++  sha256 text not null check (sha256 ~ '^[0-9a-f]{64}$'),
++  -- AES-GCM at rest: nonce (12) || encrypted CEK (32) || tag (16).
++  -- 60 bytes have an exact 80-character, unpadded standard Base64 encoding.
++  wrapped_key text not null check (wrapped_key ~ '^[A-Za-z0-9+/]{80}$'),
++  original_name text not null check (
++    char_length(original_name) between 1 and 255
++    and lower(right(original_name, 8)) = '.tendies'
++    and position('/' in original_name) = 0
++    and position(chr(92) in original_name) = 0
++    and original_name !~ '[[:cntrl:]]'
++  ),
++  requires_vip boolean not null default true,
++  active boolean not null default true,
++  created_by uuid references auth.users(id) on delete set null,
++  created_at timestamptz not null default now()
++);
++
++alter table public.dynor_encrypted_packages enable row level security;
++revoke all on table public.dynor_encrypted_packages
++  from public, anon, authenticated, service_role;
++grant select, insert on table public.dynor_encrypted_packages to service_role;
++-- Registration uses INSERT, never UPSERT. A package ID cannot replace an old key.
++-- The service may revoke/reactivate a package, but cannot rewrite its identity,
++-- content hash, key, or access policy. Owner SQL remains available for operations.
++grant update (active) on table public.dynor_encrypted_packages to service_role;
++
++create table if not exists public.dynor_package_key_rate_limits (
++  user_id uuid primary key references auth.users(id) on delete cascade,
++  window_started_at timestamptz not null,
++  request_count integer not null check (request_count between 1 and 31)
++);
++
++alter table public.dynor_package_key_rate_limits enable row level security;
++revoke all on table public.dynor_package_key_rate_limits
++  from public, anon, authenticated, service_role;
++
++-- One INSERT ... ON CONFLICT serializes concurrent requests for the same user.
++-- Requests beyond the limit saturate at 31 and remain denied until the window
++-- expires. Request counters therefore cannot overflow or reset under contention.
++create or replace function public.dynor_consume_package_key_limit(p_user_id uuid)
++returns boolean
++language plpgsql
++security definer
++set search_path = ''
++as $$
++declare
++  v_now timestamptz := clock_timestamp();
++  v_count integer;
++begin
++  if p_user_id is null then
++    return false;
++  end if;
++
++  insert into public.dynor_package_key_rate_limits as quota
++    (user_id, window_started_at, request_count)
++  values
++    (p_user_id, v_now, 1)
++  on conflict (user_id) do update
++  set window_started_at = case
++        when quota.window_started_at <= v_now - interval '60 seconds'
++          then v_now
++        else quota.window_started_at
++      end,
++      request_count = case
++        when quota.window_started_at <= v_now - interval '60 seconds'
++          then 1
++        else least(quota.request_count + 1, 31)
++      end
++  returning request_count into v_count;
++
++  return v_count <= 30;
++end;
++$$;
++
++revoke all on function public.dynor_consume_package_key_limit(uuid)
++  from public, anon, authenticated, service_role;
++grant execute on function public.dynor_consume_package_key_limit(uuid)
++  to service_role;
++
++comment on table public.dynor_encrypted_packages is
++  'Server-only encrypted content keys; DYNOR_PACKAGE_KEK is held in Edge Function secrets.';
++comment on function public.dynor_consume_package_key_limit(uuid) is
++  'Service-only atomic fixed-window limit: 30 key-release attempts per user per 60 seconds.';
++
++-- Owner SQL can revoke a package without deleting its audit or encryption record:
++-- update public.dynor_encrypted_packages set active = false
++-- where package_id = '00000000-0000-0000-0000-000000000000';
++
++commit;
+--- /dev/null
++++ b/Dynor-iOS/Tools/DynorVault/dist/setup-files/wallpaper_online.sql
+@@ -0,0 +1,57 @@
++-- Run once in Supabase SQL Editor. Does not modify existing VIP/payment tables.
++create table if not exists public.dynor_admins (
++  user_id uuid primary key references auth.users(id) on delete cascade
++);
++create table if not exists public.dynor_wallpapers (
++  id uuid primary key default gen_random_uuid(),
++  title text not null check (char_length(title) between 1 and 120),
++  category text not null default 'Khác',
++  cover_path text not null,
++  video_path text,
++  file_path text not null,
++  file_name text not null,
++  is_vip boolean not null default false,
++  published boolean not null default false,
++  created_at timestamptz not null default now()
++);
++create table if not exists public.dynor_favorites (
++  user_id uuid not null references auth.users(id) on delete cascade,
++  wallpaper_id uuid not null references public.dynor_wallpapers(id) on delete cascade,
++  created_at timestamptz not null default now(),
++  primary key(user_id, wallpaper_id)
++);
++create index if not exists dynor_wallpapers_feed_idx on public.dynor_wallpapers (published, created_at desc);
++
++alter table public.dynor_admins enable row level security;
++alter table public.dynor_wallpapers enable row level security;
++alter table public.dynor_favorites enable row level security;
++
++create or replace function public.dynor_is_admin()
++returns boolean language sql stable security definer set search_path = '' as $$
++  select exists(select 1 from public.dynor_admins where user_id = (select auth.uid()));
++$$;
++revoke all on function public.dynor_is_admin() from public;
++grant execute on function public.dynor_is_admin() to authenticated;
++
++create policy "Admin reads own status" on public.dynor_admins for select to authenticated using (user_id = (select auth.uid()));
++create policy "Published or admin read" on public.dynor_wallpapers for select to anon, authenticated using (published or (select public.dynor_is_admin()));
++create policy "Admin inserts wallpapers" on public.dynor_wallpapers for insert to authenticated with check ((select public.dynor_is_admin()));
++create policy "Admin updates wallpapers" on public.dynor_wallpapers for update to authenticated using ((select public.dynor_is_admin())) with check ((select public.dynor_is_admin()));
++create policy "Admin deletes wallpapers" on public.dynor_wallpapers for delete to authenticated using ((select public.dynor_is_admin()));
++create policy "Users read own favorites" on public.dynor_favorites for select to authenticated using (user_id = (select auth.uid()));
++create policy "Users add own favorites" on public.dynor_favorites for insert to authenticated with check (user_id = (select auth.uid()) and exists(select 1 from public.dynor_wallpapers w where w.id = wallpaper_id and w.published));
++create policy "Users remove own favorites" on public.dynor_favorites for delete to authenticated using (user_id = (select auth.uid()));
++
++insert into storage.buckets(id,name,public,file_size_limit,allowed_mime_types) values
++ ('dynor-previews','dynor-previews',true,52428800,array['image/jpeg','image/png','image/webp','video/mp4']),
++ ('dynor-downloads','dynor-downloads',false,104857600,null)
++on conflict(id) do nothing;
++
++create policy "Public reads previews" on storage.objects for select to anon, authenticated using (bucket_id = 'dynor-previews');
++create policy "Admin uploads previews and files" on storage.objects for insert to authenticated with check (bucket_id in ('dynor-previews','dynor-downloads') and (select public.dynor_is_admin()));
++create policy "Admin updates previews and files" on storage.objects for update to authenticated using (bucket_id in ('dynor-previews','dynor-downloads') and (select public.dynor_is_admin())) with check (bucket_id in ('dynor-previews','dynor-downloads') and (select public.dynor_is_admin()));
++create policy "Admin removes previews and files" on storage.objects for delete to authenticated using (bucket_id in ('dynor-previews','dynor-downloads') and (select public.dynor_is_admin()));
++-- Downloads are private; signed URLs are issued only by the Edge Function.
++
++-- IMPORTANT: Replace UUID below with YOUR auth.users.id (not your email).
++-- insert into public.dynor_admins(user_id) values ('YOUR-USER-UUID');
+--- /dev/null
++++ b/Dynor-iOS/Tools/DynorVault/dist/setup.css
+@@ -0,0 +1 @@
++html{color-scheme:light}body{margin:0;background:#f5f5ef;color:#173c33;font:16px/1.75 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}main{max-width:900px;margin:auto;padding:30px 24px 80px}nav{display:flex;justify-content:space-between;gap:20px;margin-bottom:40px}a{color:#17634c;text-underline-offset:4px}h1{font-size:34px;line-height:1.25;letter-spacing:-.8px}h2{font-size:23px;margin-top:46px}h3{font-size:19px}aside{background:#e0eccf;padding:16px 20px;border-radius:12px}pre{background:#102c29;color:#e8f1e7;border-radius:12px;padding:20px;overflow:auto;font:13px/1.6 ui-monospace,SFMono-Regular,Consolas,monospace}code{font-family:ui-monospace,SFMono-Regular,Consolas,monospace;font-size:.9em}p code,li code{background:#e5e9df;padding:2px 4px;border-radius:4px}li{margin:9px 0}p{overflow-wrap:anywhere}a:focus-visible{outline:3px solid #79975c;outline-offset:4px}@media(max-width:600px){main{padding:22px 18px 50px}h1{font-size:28px}nav{font-size:13px}pre{margin-left:-6px;margin-right:-6px;padding:16px}}--- /dev/null
++++ b/Dynor-iOS/Tools/DynorVault/dist/setup.html
+@@ -0,0 +1,81 @@
++<!doctype html><html lang="vi"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="robots" content="noindex,nofollow"><meta name="referrer" content="no-referrer"><title>Thiết lập · Dynor Vault</title><link rel="stylesheet" href="setup.css"></head><body><main><nav><a href="./">← Dynor Vault</a><a href="setup-files/dynor-package-backend.zip" download>Tải source backend</a></nav><aside>Cần triển khai dịch vụ Supabase và build IPA mới trước khi dùng gói mã hóa.</aside><h1>Thiết lập gói Tendies mã hóa cho Dynor</h1>
++<p>Website riêng: <a href="https://dynor-vault.amberstingray1.chatgpt.site">Dynor Vault</a>. Công cụ nhận <code>.tendies</code>, mã hóa ngay trong trình duyệt và tạo <code>.dynor</code>. File hình nền gốc không được tải lên website hoặc Supabase trong bước mã hóa. Khóa nội dung được gửi qua HTTPS tới Edge Function dành cho quản trị viên để đăng ký; chỉ sau khi đăng ký thành công mới có thể tải file mã hóa về.</p>
++<p>Đây là hệ thống <strong>cần triển khai backend trước khi dùng</strong>, không chỉ là đổi đuôi file. Site riêng và quyền quản trị Supabase là hai lớp truy cập khác nhau: mở được Site vẫn phải đăng nhập email OTP bằng tài khoản có trong <code>dynor_admins</code>. Bản mã nguồn không chứa khóa giải mã production; các khóa cố định trong fixture là dữ liệu kiểm thử.</p>
++<h2>1. Dùng đúng project, tài khoản và quyền VIP hiện có</h2>
++<p>Project mặc định của app và website là <code>https://wkivekbodwbinmvargts.supabase.co</code>, project ref <code>wkivekbodwbinmvargts</code>. Nếu đổi project, phải đổi cấu hình công khai tương ứng trong app và website rồi build/publish lại. Supabase publishable/anon key chỉ nhận diện project; nó không phải khóa nội dung hay service-role key.</p>
++<p>Giữ nguyên hệ thống OTP, tài khoản, thanh toán và <code>dynor_vip</code> hiện có. Không tạo hệ thống VIP thứ hai. Backend kiểm tra quyền VIP bằng <code>plan_id</code> và <code>vip_expires_at</code>: quyền <code>lifetime</code> với ngày hết hạn <code>null</code>, hoặc ngày hết hạn còn ở tương lai. Việc hỗ trợ kiểm tra bản ghi lifetime không tự bật bán gói lifetime trong ứng dụng.</p>
++<h2>2. Chạy SQL</h2>
++<p>Trong Supabase Dashboard → SQL Editor của đúng project:</p>
++<ol>
++<li>Nếu chưa thiết lập Gallery online, chạy toàn bộ <a href="setup-files/wallpaper_online.sql">Supabase/sql/wallpaper_online.sql</a> theo <a href="setup-files/WALLPAPER_ONLINE_SETUP.md">hướng dẫn online</a>. Không chạy lại script cũ có các <code>create policy</code> nếu đã thiết lập.</li>
++<li>Chạy <strong>nguyên nội dung</strong> <a href="setup-files/encrypted_packages.sql">Supabase/sql/encrypted_packages.sql</a>. Đây là schema chính xác cho hai Edge Function bên dưới; không tự tạo bảng khóa với quyền đọc công khai. Script bổ sung bảng gói, RLS, quyền service-only và RPC giới hạn yêu cầu.</li>
++<li>Authentication → Users → sao chép UID tài khoản quản trị của chính bạn. Chạy SQL sau, thay giá trị mẫu bằng UUID thật:</li>
++</ol>
++<pre><code>insert into public.dynor_admins(user_id)
++values (&#x27;YOUR-AUTH-USER-UUID&#x27;::uuid)
++on conflict do nothing;</code></pre>
++<p>Không cấp <code>select</code> bảng <code>dynor_encrypted_packages</code> cho <code>anon</code> hoặc <code>authenticated</code>, kể cả để website quản trị tự đọc khóa. Quản trị viên đăng ký gói qua Function; chỉ server có service-role credential mới truy cập dữ liệu khóa. Bản ghi gói dùng UUID mới cho mỗi lần mã hóa; API không ghi đè ID, hash, khóa hoặc chính sách của gói đã có.</p>
++<h2>3. Tạo và lưu secret KEK một lần</h2>
++<p><code>DYNOR_PACKAGE_KEK</code> là Base64 chuẩn của <strong>đúng 32 byte ngẫu nhiên</strong>. Nó dùng mã hóa khóa nội dung trong cơ sở dữ liệu và chỉ nằm ở Supabase Edge Function Secrets cùng bản sao bảo mật của bạn. Không nhập nó vào Dynor Vault, source iOS, GitHub, Sites, URL, ảnh chụp hoặc log build.</p>
++<p>Trên máy tin cậy đã cài Supabase CLI và Python 3, mở terminal tại thư mục source có <code>project.yml</code>. Tắt shell tracing; lệnh dưới tạo file tạm chỉ chủ tài khoản đọc được và không in giá trị khóa:</p>
++<pre><code>set +x
++umask 077
++dynor_secret_dir=&quot;$(mktemp -d)&quot;
++python3 - &quot;$dynor_secret_dir/package.env&quot; &lt;&lt;&#x27;PY&#x27;
++import base64
++import secrets
++import sys
++
++with open(sys.argv[1], &quot;x&quot;, encoding=&quot;ascii&quot;) as output:
++    output.write(&quot;DYNOR_PACKAGE_KEK=&quot; + base64.b64encode(secrets.token_bytes(32)).decode(&quot;ascii&quot;) + &quot;\n&quot;)
++PY
++supabase login
++supabase secrets set --project-ref wkivekbodwbinmvargts --env-file &quot;$dynor_secret_dir/package.env&quot;</code></pre>
++<p>Lưu bản sao của secret vào trình quản lý bí mật tin cậy bằng phương thức nhập file an toàn trước khi xóa file tạm. Không dùng <code>cat</code>, <code>echo</code> hoặc chế độ log debug để xem khóa. Khi đã xác nhận secret được lưu trên Supabase và bản sao bảo mật có thể khôi phục, dọn file tạm trong cùng phiên shell:</p>
++<pre><code>rm -- &quot;$dynor_secret_dir/package.env&quot;
++rmdir -- &quot;$dynor_secret_dir&quot;
++unset dynor_secret_dir</code></pre>
++<p><strong>Không chạy lại bước tạo khóa để cập nhật app hoặc deploy Function. Không tự động xoay KEK.</strong> Thay/mất KEK làm server không mở được các khóa nội dung cũ và các <code>.dynor</code> đã phát hành ngừng cài được. Phiên bản hiện tại không có key version hay quy trình migration tự động. Nếu cần xoay, phải lên kế hoạch mở và bọc lại tất cả khóa bằng KEK cũ/mới trước khi chuyển secret; không chỉ ghi đè giá trị trong Dashboard.</p>
++<p>Hai Function còn cần <code>SUPABASE_URL</code>, <code>SUPABASE_ANON_KEY</code>, <code>SUPABASE_SERVICE_ROLE_KEY</code>, thường đã có sẵn trong môi trường Edge Functions. Nếu project thiếu, cấu hình phía server qua Supabase Secrets; không chuyển service-role key sang website hoặc iOS.</p>
++<h2>4. Deploy đúng hai Edge Function</h2>
++<p>Source dùng thư mục <code>Supabase/</code> viết hoa, khác layout CLI mặc định <code>supabase/functions/</code>. Lệnh sau tạo layout deploy tạm, giữ nguyên cả hai module dùng chung. Chạy từ thư mục chứa <code>project.yml</code>, sau bước đăng nhập CLI:</p>
++<pre><code>dynor_deploy_dir=&quot;$(mktemp -d)&quot;
++supabase init --workdir &quot;$dynor_deploy_dir&quot;
++mkdir -p &quot;$dynor_deploy_dir/supabase/functions&quot;
++cp -R Supabase/_shared Supabase/dynor-register-package Supabase/dynor-package-key &quot;$dynor_deploy_dir/supabase/functions/&quot;
++supabase functions deploy dynor-register-package --project-ref wkivekbodwbinmvargts --no-verify-jwt --workdir &quot;$dynor_deploy_dir&quot;
++supabase functions deploy dynor-package-key --project-ref wkivekbodwbinmvargts --no-verify-jwt --workdir &quot;$dynor_deploy_dir&quot;</code></pre>
++<p>Deploy thành công cả hai rồi xóa thư mục deploy tạm:</p>
++<pre><code>rm -rf -- &quot;$dynor_deploy_dir&quot;
++unset dynor_deploy_dir</code></pre>
++<p><code>--no-verify-jwt</code> tắt kiểm tra JWT tại <strong>gateway của hai Function này</strong> để tương thích cấu hình publishable key; không tắt đăng nhập trong code. Hai handler luôn xác minh Bearer token bằng <code>auth.getUser(jwt)</code>. <code>dynor-register-package</code> kiểm tra thêm quyền <code>dynor_admins</code>; <code>dynor-package-key</code> kiểm tra gói, hash, trạng thái active, chính sách VIP và quota. Không bỏ các kiểm tra này và không áp dụng thay đổi gateway hàng loạt cho Function khác.</p>
++<p>Không deploy riêng <code>index.ts</code> mà bỏ <code>_shared/package-handlers.mjs</code> hoặc <code>_shared/package-crypto.mjs</code>. Thiếu secret/schema hoặc lỗi tra quyền đều phải dừng cấp khóa. Giới hạn hiện tại là <strong>30 lần yêu cầu khóa/tài khoản/60 giây</strong>, gồm cả yêu cầu sai định dạng; hết quota trả 429 và cần chờ rồi thử lại.</p>
++<h2>5. Mã hóa và phát hành nội dung</h2>
++<ol>
++<li>Mở <a href="https://dynor-vault.amberstingray1.chatgpt.site">Dynor Vault</a>, đăng nhập OTP bằng email quản trị đã cấp ở bước 2.</li>
++<li>Chọn <code>.tendies</code> hợp lệ, không rỗng, tối đa 50 MiB. Trình duyệt kiểm tra dấu hiệu ZIP; Dynor vẫn kiểm tra toàn bộ archive và descriptor khi cài.</li>
++<li>Chọn chính sách gói <strong>Yêu cầu VIP</strong>. Mặc định bật. Khi tắt, mọi tài khoản Dynor đã đăng nhập đều có thể xin khóa của gói đang active nếu có file; đây không phải gói dành riêng cho người mua.</li>
++<li>Mã hóa và chờ đăng ký thành công, sau đó tải <code>ten-goi.dynor</code>. Công cụ không xuất khóa hoặc tạo file giải mã. Không chia sẻ file <code>.tendies</code> gốc nếu mục tiêu là chỉ phân phối bản mã hóa.</li>
++<li>Có thể gửi <code>.dynor</code> trực tiếp cho người dùng. Nếu muốn hiện ở Khám phá, mở trang quản trị Gallery hiện có, upload <code>.dynor</code> làm <strong>File tải về</strong>, thêm bìa/video và publish bài. Không upload <code>.tendies</code> gốc làm file tải thay thế.</li>
++</ol>
++<p><strong>Quyền VIP của gói độc lập với <code>is_vip</code> của bài Gallery.</strong> <code>is_vip</code> kiểm soát tải từ catalog; <code>requires_vip</code> của gói kiểm soát cấp khóa kể cả khi file được nhập cục bộ. Muốn bảo vệ nội dung VIP, bật cả hai. Chỉ bật VIP cho bài Gallery trong khi đăng ký gói <code>requires_vip = false</code> không ngăn tài khoản thường mở bản <code>.dynor</code> được người khác gửi. API không sửa chính sách gói cũ: khi muốn đổi chính sách, tạo và phát hành gói mới với UUID mới.</p>
++<p>Nếu đăng ký thành công nhưng đóng trang trước khi tải file, khóa không được lưu trong local/session storage để khôi phục. Mở lại <code>.tendies</code> gốc và mã hóa thành gói mới; không cố ghi đè ID cũ. Giữ bản gốc riêng ở nơi an toàn để có thể phát hành lại khi cần.</p>
++<h2>6. Cài bằng ứng dụng iOS</h2>
++<p>Build/cài IPA mới có hỗ trợ <code>.dynor</code> bằng pipeline hiện có; số phiên bản không tự thay trong bộ mã này. Nhập <code>.dynor</code> qua Thư viện → <code>+</code>, Tệp → Mở bằng Dynor, hoặc tải từ Khám phá. Thư viện lưu <strong>bản mã hóa</strong>. File <code>.tendies</code> cũ vẫn nhập và cài bình thường; nó không tự trở thành file được bảo vệ.</p>
++<p>Với <code>.dynor</code>, <strong>mỗi lần cài cần kết nối mạng và tài khoản đăng nhập còn hợp lệ</strong>. Gói VIP yêu cầu quyền VIP hợp lệ ở thời điểm xin khóa. Khóa nội dung không được cache để cài offline. App tạo khóa P-256 không xuất được trong Secure Enclave; server bọc khóa nội dung cho khóa công khai này. Tham chiếu khóa thiết bị nằm trong Keychain <code>ThisDeviceOnly</code>. Không có fallback sang khóa tĩnh khi Secure Enclave/server không sẵn sàng; Simulator không thay thế kiểm tra trên iPhone thật.</p>
++<p>Sau giải mã, gói vẫn phải qua kiểm tra ZIP, CRC, đường dẫn, giới hạn giải nén và descriptor trước native write. Pairing, LocalDevVPN và phạm vi iOS được hỗ trợ giữ nguyên. Ảnh thường vẫn lưu vào Photos/chia sẻ ảnh; <code>.dynor</code> và <code>.tendies</code> không có nút xuất/chia sẻ gói trong app.</p>
++<p>Bản rõ tạm nằm trong <code>Application Support/Dynor/InstallStaging/&lt;UUID&gt;</code> với file protection đầy đủ, quyền thư mục 0700/file 0600 và loại khỏi backup. App cố dọn staging khi thành công/lỗi và dọn lại staging cũ lúc khởi động. Crash hoặc hệ điều hành không cho xóa có thể để lại dữ liệu đến lần dọn sau; thao tác xóa không phải cam kết xóa an toàn mọi dấu vết. Nội dung đã cài vào PosterBoard cần tồn tại để iOS hiển thị hình nền.</p>
++<h2>7. Dừng cấp quyền một gói</h2>
++<p>Trong SQL Editor bằng tài khoản sở hữu project, thay UUID mẫu bằng <code>package_id</code> của gói:</p>
++<pre><code>update public.dynor_encrypted_packages
++set active = false
++where package_id = &#x27;PACKAGE-UUID&#x27;::uuid;</code></pre>
++<p>Muốn cho phép lại, đặt <code>active = true</code>. Để kiểm tra danh sách mà không đọc cột chứa khóa:</p>
++<pre><code>select package_id, original_name, requires_vip, active, created_at
++from public.dynor_encrypted_packages
++order by created_at desc;</code></pre>
++<p>Ẩn bài Gallery không tự thu hồi gói đã tải: phải tắt <code>active</code> nếu muốn ngừng cấp khóa. Thu hồi chặn lần cấp khóa tiếp theo; không xóa hình nền đã cài và không thu hồi được khóa đã cấp cho một thao tác đang chạy. Không xóa bảng hay mất KEK để thu hồi từng gói.</p>
++<h2>Giới hạn bảo vệ và kiểm tra trước khi dùng</h2>
++<p>IPA tự ký có thể bị sửa hoặc ký lại. Backend này xác thực <strong>tài khoản và quyền của gói</strong>, không dùng App Attest để chứng minh ứng dụng Dynor nguyên bản. Client khác có token hợp lệ và quyền gói có thể gọi giao thức cấp khóa bằng khóa P-256 của chính nó; Secure Enclave ở app chính không khiến server tự nhận diện được client gốc. Không quảng cáo đây là cách tuyệt đối buộc mọi <code>.dynor</code> chỉ mở được trong IPA của bạn.</p>
++<p>Trong lúc cài, khóa nội dung và dữ liệu đã giải mã phải được sử dụng bởi tiến trình app; sau khi cài, PosterBoard giữ nội dung. Thiết bị bị can thiệp, client đã sửa hoặc tài khoản có quyền có thể trích xuất và phân phối lại. Cơ chế này tránh nhúng khóa dùng chung trong source và quản lý việc cấp khóa; không có cam kết chống trích xuất tuyệt đối.</p>
++<p>Xem <a href="setup-files/VERIFICATION.md">VERIFICATION.md</a> để kiểm tra đúng/sai quyền, hash/tag, thu hồi, cleanup và tương thích iOS. Chạy unit test/mô phỏng trên Linux không xác nhận deploy Supabase, Secure Enclave, build Xcode hoặc cài hình nền trên iPhone thành công.</p></main></body></html>--- /dev/null
++++ b/Dynor-iOS/Tools/DynorVault/dist/styles.css
+@@ -0,0 +1 @@
++:root{color-scheme:light;--ink:#16332f;--muted:#72817a;--accent:#133f36;--paper:#f5f5ef;--line:#e6e8e1;--mint:#dfeccf;--error:#9c3838;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;font-synthesis:none}*{box-sizing:border-box}html{scroll-behavior:smooth}body{margin:0;background:var(--paper);color:var(--ink);font-size:14px;line-height:1.5}button,input,a{-webkit-tap-highlight-color:transparent}button,input{font:inherit}button,a,label{touch-action:manipulation}button,a{outline-offset:4px}button:focus-visible,a:focus-visible,label:focus-visible,input:focus-visible{outline:3px solid #93ad67}button{cursor:pointer}button:disabled{cursor:not-allowed}a{color:inherit;text-decoration:none}svg{width:20px;height:20px;fill:none;stroke:currentColor;stroke-width:1.7;stroke-linecap:round;stroke-linejoin:round;flex-shrink:0}[hidden]{display:none!important}.visually-hidden{position:absolute!important;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;clip:rect(0,0,0,0);white-space:nowrap;border:0}.app-shell{display:flex;min-height:100vh}.sidebar{background:#102c29;color:#e8eee5;width:246px;flex-shrink:0;display:flex;flex-direction:column;padding:36px 25px 27px;position:fixed;inset:0 auto 0 0}.brand{display:flex;align-items:center;gap:13px;font-size:31px;font-weight:650;letter-spacing:-1.5px;line-height:1}.brand>span:last-child{display:flex;align-items:baseline;gap:10px}.brand-subtitle{font-size:9px;letter-spacing:2px;color:#b6c9ab;font-weight:500}.brand-mark{display:inline-flex;align-items:center;justify-content:center;border:1px solid #7b9b89;border-radius:11px;width:36px;height:42px;font-size:28px;font-weight:300;position:relative}.brand-mark>span{width:12px;height:12px;position:absolute;bottom:5px;right:4px;background:#c8dfb2;border-radius:50%;opacity:.9}.sidebar-main{padding-top:65px}.eyebrow{font-size:10px;letter-spacing:1.8px;font-weight:650}.sidebar-label{color:#94aca0;font-size:9px;letter-spacing:1.4px;margin-bottom:19px}.side-link{display:flex;align-items:center;gap:11px;padding:14px 12px;margin-bottom:8px;font-size:12px;border-radius:8px;color:#b9c9be}.side-link.active{background:#23473e;color:#edf4e9}.side-link svg{width:17px;height:17px}.active-dot{width:5px;height:5px;border-radius:50%;background:#cbe1b4;margin-left:auto}.sidebar-note{margin-top:90px;border:1px solid #355048;border-radius:12px;padding:22px 18px;font-size:13px;line-height:1.8;color:#dbe5d8}.small-shield{display:inline-flex;font-size:33px;line-height:1;color:#bdd3a7}.sidebar-note p{margin:16px 0}.note-rule{height:1px;background:#355048;margin:17px 0}.sidebar-note .sidebar-note-secondary{font-size:11px;color:#91aaa0;margin-bottom:2px}.sidebar-footer{margin-top:auto;font-size:9px;color:#93aa9e;display:flex;align-items:center;gap:6px;padding-top:25px}.connection-dot{width:5px;height:5px;background:#b3d18c;border-radius:50%}.content-shell{width:calc(100% - 246px);margin-left:246px}.topbar{height:76px;border-bottom:1px solid var(--line);display:flex;align-items:center;justify-content:space-between;padding:0 53px;font-size:11px;color:#79847c}.private-badge{display:flex;align-items:center;gap:7px;font-size:10px;color:#587262}.private-badge svg{width:15px;height:15px}main{max-width:1350px;margin:0 auto;padding:47px 53px 22px}.intro{display:flex;justify-content:space-between;align-items:center;margin-bottom:36px;min-height:225px}.intro .eyebrow{color:#7a8b76;font-size:9px}h1{font-size:49px;line-height:1.12;letter-spacing:-2px;font-weight:500;margin:19px 0 15px}h1 em{font-family:Georgia,"Times New Roman",serif;font-weight:400;color:#758b54}h1+p{font-size:13px;line-height:1.75;color:#788279;margin:0}.intro-art{position:relative;width:270px;height:210px;margin:0 24px 0 50px;flex-shrink:0}.art-orbit{position:absolute;border:1px solid #dce1d3;border-radius:50%;width:235px;height:180px;top:22px;left:17px;transform:rotate(-24deg)}.orbit-two{width:180px;height:235px;top:-5px;left:46px;transform:rotate(-24deg)}.art-folder{position:absolute;border-radius:10px 10px 15px 15px;width:120px;height:133px;box-shadow:0 10px 25px #26392c0e}.art-folder:before{content:"";position:absolute;width:50px;height:14px;top:-10px;left:0;border-radius:7px 10px 0 0;background:inherit}.folder-back{background:#d8e4c6;left:65px;top:38px;transform:rotate(-14deg);border:1px solid #cbdabb}.folder-front{background:#1b453a;left:112px;top:65px;transform:rotate(11deg);display:flex;flex-direction:column;align-items:center;justify-content:center;color:#dce8ca;gap:11px}.folder-front svg{width:37px;height:37px;stroke-width:1.2}.folder-front span{font-size:11px;letter-spacing:1px}.art-star{position:absolute;left:45px;top:147px;color:#91a77a;font-size:24px}.workspace{display:grid;grid-template-columns:minmax(0,1.42fr) minmax(290px,1fr);gap:24px;align-items:start}.card{background:#fff;border:1px solid var(--line);border-radius:15px;box-shadow:0 4px 15px #24382a02}.encrypt-card{padding:25px 27px 22px}.card-heading{display:flex;align-items:center;justify-content:space-between;gap:12px;margin-bottom:24px}.card-heading>div{display:flex;align-items:center;gap:10px}h2{font-size:15px;letter-spacing:-.3px;font-weight:620;margin:0}.section-number{font-size:9px;color:#9caa93;border:1px solid #e6ebdf;border-radius:5px;padding:3px 5px}.format-badge{font-size:9px;color:#72866d;background:#f0f4e9;border-radius:5px;padding:5px 7px;white-space:nowrap}.drop-zone{display:flex;align-items:center;justify-content:center;flex-direction:column;border:1.5px dashed #cbd6c1;background:#fbfcf8;border-radius:11px;padding:30px 12px 25px;cursor:pointer;min-height:218px;text-align:center;transition:background .2s,border-color .2s}.drop-zone:hover,.drop-zone.dragover{background:#f0f5e7;border-color:#79976b}.drop-zone:focus-within{outline:3px solid #93ad67;outline-offset:3px}.upload-icon{display:flex;align-items:center;justify-content:center;width:49px;height:49px;background:#eaf0df;border-radius:12px;color:#6f8457;margin-bottom:16px}.upload-icon svg{width:24px;height:24px;stroke-width:1.5}.drop-zone strong{font-size:14px;font-weight:600;margin-bottom:6px}.drop-zone>span:not(.upload-icon){font-size:11px;color:#8b958b}.text-link{color:#506d48;text-decoration:underline;text-underline-offset:3px}.drop-zone .drop-caption{font-size:9px!important;letter-spacing:.2px;margin-top:17px;color:#a1a99b!important}.selected-file{display:flex;align-items:center;gap:12px;padding:15px 13px;background:#f2f5eb;border:1px solid #dbe4cd;border-radius:10px;margin-top:14px;min-width:0}.selected-file>div{display:flex;flex-direction:column;min-width:0}.selected-file strong{font-size:12px;white-space:nowrap;text-overflow:ellipsis;overflow:hidden}.selected-file>div>span{color:#87917d;font-size:10px;margin-top:3px}.file-icon{border:1px solid #a8bc8f;border-radius:5px;font-size:16px;font-family:Georgia,serif;color:#6b8754;width:31px;height:37px;display:flex;align-items:center;justify-content:center;flex-shrink:0}.icon-button{margin-left:auto;font-size:23px;line-height:1;background:none;border:0;color:#89997e;padding:4px 7px}.settings-block{margin-top:25px}.settings-title{font-size:9px;font-weight:650;letter-spacing:1.4px;color:#91a081;margin-bottom:11px}.access-option{display:flex;align-items:center;gap:10px;padding:13px 12px;border:1px solid #e7e9e0;border-radius:9px;cursor:pointer}.access-icon{font-size:20px;color:#9aab73;width:24px;text-align:center}.access-option>span:nth-child(2){display:flex;flex-direction:column;gap:3px;flex:1}.access-option strong{font-size:11px;font-weight:600}.access-option small{font-size:9px;color:#929a8e}.switch{position:relative;flex-shrink:0;display:inline-flex}.switch input{position:absolute;inset:0;width:100%;height:100%;opacity:0;cursor:pointer;margin:0;z-index:1}.switch-track{display:block;width:33px;height:19px;border-radius:15px;background:#bfc8b9;transition:background .2s}.switch-track:after{content:"";position:absolute;width:13px;height:13px;left:3px;top:3px;border-radius:50%;background:#fff;transition:transform .2s}.switch input:checked+.switch-track{background:#345e46}.switch input:checked+.switch-track:after{transform:translateX(14px)}.switch input:focus-visible+.switch-track{outline:3px solid #93ad67;outline-offset:4px}.primary-button{border:0;display:flex;align-items:center;justify-content:center;gap:9px;background:#173f34;color:white;font-size:12px;font-weight:550;border-radius:9px;width:100%;padding:15px 14px;margin-top:23px;transition:background .2s}.primary-button:hover:not(:disabled){background:#245541}.primary-button:disabled{background:#e5e9df;color:#8d9c83}.primary-button svg{width:17px;height:17px}.button-arrow{margin-left:auto}.primary-button>span{margin-right:auto}.action-hint{text-align:center;font-size:9px;color:#939d8d;margin:10px 0 0}.privacy-note{display:flex;gap:9px;border-top:1px solid var(--line);padding-top:18px;margin-top:21px;color:#8a9684;align-items:flex-start}.privacy-note svg{width:17px;height:17px;color:#92a17e}.privacy-note p{font-size:9px;line-height:1.65;margin:0}.right-column{display:flex;flex-direction:column;gap:22px}.account-card{padding:24px}.account-card .card-heading{margin-bottom:15px;align-items:flex-start}.account-card .card-heading>div{gap:8px}.account-card h2{font-size:13px}.account-state{font-size:8px;padding-top:4px;color:#99a18f;white-space:nowrap}.account-state.connected{color:#517348}.account-copy{font-size:11px;color:#8c9586;margin:0 0 18px;line-height:1.65}.field-label{font-size:10px;font-weight:550;color:#6c7c62;display:block;margin-bottom:7px}.text-input{font-size:11px;padding:12px 13px;border:1px solid #e2e6da;border-radius:7px;background:#fcfdf9;width:100%;color:#314931;outline-offset:3px}.text-input::placeholder{color:#a7b09d}.secondary-button{border:1px solid #cdd8c0;border-radius:7px;background:#f6f9f0;padding:11px 12px;font-size:10px;color:#5c7549;display:flex;align-items:center;justify-content:space-between;gap:10px;width:100%;margin-top:10px}.secondary-button svg{width:15px;height:15px}.secondary-button:hover:not(:disabled){background:#ecf3df}.secondary-button:disabled{opacity:.5}#otp-panel{margin-top:16px}.auth-status{font-size:10px;line-height:1.6;color:#718569;margin:13px 0 0;overflow-wrap:anywhere}.auth-status:empty{display:none}.auth-status.error{color:var(--error)}.signed-in{display:flex;align-items:center;flex-wrap:wrap;gap:11px;background:#f5f8ef;border-radius:9px;padding:14px 12px}.user-avatar{height:31px;width:31px;background:#e3ecd4;border-radius:50%;display:flex;align-items:center;justify-content:center;color:#78945e;font-family:Georgia,serif}.signed-in>div{min-width:0;flex:1}.signed-in strong{font-size:10px;display:block}.signed-in>div>span{display:block;font-size:9px;color:#829477;overflow-wrap:anywhere}.text-button{font-size:9px;border:0;background:none;text-decoration:underline;text-underline-offset:3px;color:#69815c;padding:4px}.workflow-card{padding:25px 24px 18px;border:1px solid #e0e5d6;background:#ebefdf;border-radius:14px}.workflow-card>.eyebrow{font-size:8px;color:#91a080;letter-spacing:1.4px}.workflow-card h2{font-family:Georgia,"Times New Roman",serif;font-weight:400;font-size:23px;margin-top:10px;color:#405a38;letter-spacing:-.6px}.workflow{padding:0;margin:23px 0 20px;list-style:none}.workflow li{display:flex;gap:13px;position:relative;padding-bottom:19px}.workflow li:last-child{padding-bottom:0}.workflow li:not(:last-child):after{content:"";width:1px;height:calc(100% - 25px);position:absolute;left:12px;top:28px;background:#d0dac0}.workflow li>span{width:25px;height:25px;display:flex;align-items:center;justify-content:center;border:1px solid #c3d1ae;border-radius:50%;font-size:10px;color:#719154;flex-shrink:0;background:#f4f7ed}.workflow strong{font-size:11px;font-weight:600;color:#4c6742}.workflow p{font-size:10px;line-height:1.6;color:#8a977d;margin:4px 0 0}.workflow-footer{display:flex;align-items:center;gap:8px;border-top:1px solid #d4ddc6;padding-top:14px;font-size:9px;color:#80916f}.workflow-footer svg{width:15px;height:15px}.page-footer{display:flex;align-items:flex-start;justify-content:space-between;gap:24px;font-size:8px;color:#929d89;border-top:1px solid #e1e6d7;margin-top:35px;padding-top:19px;line-height:1.7}.page-footer>span:last-child{text-align:right;max-width:380px}.page-footer a{text-decoration:underline;text-underline-offset:3px;white-space:nowrap}.operation-status{margin-top:16px;display:flex;align-items:flex-start;gap:8px;font-size:10px;background:#f4f7ef;color:#567246;border:1px solid #e3ead9;border-radius:8px;padding:11px 12px;line-height:1.65}.operation-status.error{color:var(--error);background:#fcf2f0;border-color:#eeded9}.status-dot{height:6px;width:6px;border-radius:50%;background:currentColor;flex-shrink:0;margin-top:5px}.operation-status.busy .status-dot{animation:pulse 1s infinite}.result-panel{margin-top:17px;border:1px solid #bace9f;background:#f3f8eb;border-radius:10px;padding:16px 14px;display:flex;gap:10px;flex-wrap:wrap;align-items:center}.result-check{background:#dcebc9;border-radius:50%;height:27px;width:27px;display:flex;align-items:center;justify-content:center;color:#6f914a}.result-panel>div{min-width:0;flex:1}.result-panel strong{font-size:11px;font-weight:600}.result-panel p{font-size:10px;color:#7b916b;margin:3px 0 0;overflow-wrap:anywhere}.download-button{display:flex;align-items:center;justify-content:center;gap:9px;width:100%;padding:11px;border-radius:7px;background:#31563e;color:white;font-size:11px;margin-top:7px}.download-button svg{width:15px;height:15px}.busy .drop-zone{opacity:.6;cursor:wait}@keyframes pulse{50%{opacity:.25}}@media(min-width:1500px){main{padding-top:60px}.intro{margin-bottom:45px}.workspace{gap:28px}.encrypt-card{padding:30px}.drop-zone{min-height:250px}}@media(max-width:1160px){.sidebar{width:206px;padding:33px 19px}.content-shell{margin-left:206px;width:calc(100% - 206px)}main{padding:35px 31px 20px}.topbar{padding:0 31px}.workspace{gap:18px;grid-template-columns:minmax(0,1.2fr) minmax(270px,1fr)}.encrypt-card{padding:23px 21px}.account-card{padding:22px 18px}.intro-art{margin-right:0;width:240px;transform:scale(.9);transform-origin:right center}.card-heading{gap:8px}h1{font-size:45px}.account-card .card-heading{flex-wrap:wrap}.account-state{padding-left:31px;padding-top:0}.format-badge{font-size:8px}}@media(max-width:960px){.sidebar{width:78px;align-items:center;padding:27px 13px}.brand>span:last-child,.sidebar-label,.side-link,.sidebar-note,.sidebar-footer{display:none}.sidebar-main{padding-top:40px}.content-shell{margin-left:78px;width:calc(100% - 78px)}main{padding:34px 29px 20px}.topbar{padding:0 29px}.workspace{grid-template-columns:minmax(0,1.3fr) minmax(260px,1fr)}.intro{min-height:210px}.intro-art{margin-left:20px}.page-footer{font-size:8px}}@media(max-width:760px){.sidebar{position:static;width:auto;height:71px;flex-direction:row;padding:0 22px;background:#102c29}.brand>span:last-child{display:flex;font-size:26px}.brand-mark{height:34px;width:30px;font-size:23px;border-radius:9px}.brand-mark>span{height:9px;width:9px}.sidebar-main{display:none}.app-shell{display:block}.content-shell{width:100%;margin:0}.topbar{height:51px;padding:0 22px;font-size:10px}.private-badge{font-size:9px}.private-badge svg{width:13px;height:13px}main{padding:32px 22px 23px}.intro{min-height:185px;margin-bottom:28px}.intro-art{width:180px;transform:scale(.7);transform-origin:right center;margin-left:0;margin-right:-10px}.intro .eyebrow{font-size:8px;letter-spacing:1.2px}h1{font-size:39px;margin-top:15px}h1+p{font-size:11px}.workspace{grid-template-columns:1fr}.right-column{display:grid;grid-template-columns:1fr 1fr;gap:16px}.encrypt-card{padding:23px}.drop-zone{min-height:210px}.account-card{padding:21px}.workflow-card{padding:22px 19px 17px}.account-card .card-heading{gap:7px}.account-state{padding-left:0}.page-footer{margin-top:27px}}@media(max-width:520px){main{padding:27px 16px 20px}.topbar{padding:0 16px}.intro-art{width:100px;transform:scale(.53);height:175px;margin-right:-10px;opacity:.9}.intro{min-height:180px;margin-bottom:25px}h1{font-size:38px;letter-spacing:-1.4px}h1+p{font-size:11px;max-width:250px}.intro .eyebrow{font-size:7px}.intro-art .orbit-one,.intro-art .orbit-two{opacity:.6}.intro-art .folder-back{left:0}.intro-art .folder-front{left:47px}.intro-art .art-star{left:-20px}.right-column{display:flex;gap:17px}.encrypt-card{padding:21px 18px}.card-heading{gap:10px;margin-bottom:20px}h2{font-size:14px}.drop-zone{min-height:205px}.drop-zone>span:not(.upload-icon){font-size:10px}.format-badge{font-size:8px}.access-option{padding:12px 10px}.access-option small{font-size:9px}.page-footer{display:block;font-size:8px}.page-footer>span{display:block}.page-footer>span:last-child{text-align:left;max-width:none;margin-top:8px}.account-card .card-heading{flex-wrap:nowrap}.account-state{padding-top:2px}.account-copy{font-size:11px}.field-label{font-size:10px}.text-input{font-size:14px}.secondary-button{font-size:11px}.workflow-card h2{font-size:25px}.workflow strong{font-size:12px}.workflow p{font-size:11px}.workflow-footer{font-size:10px}}@media(prefers-reduced-motion:reduce){html{scroll-behavior:auto}*{animation:none!important;transition:none!important}}
+--- /dev/null
++++ b/Dynor-iOS/Tools/DynorVault/package.json
+@@ -0,0 +1,6 @@
++{
++  "name": "dynor-vault",
++  "private": true,
++  "type": "module",
++  "scripts": { "test": "node --test tests/*.test.mjs", "check": "node --check dist/app.mjs && node --check dist/crypto.mjs" }
++}
+--- /dev/null
++++ b/Dynor-iOS/Tools/DynorVault/tests/crypto.test.mjs
+@@ -0,0 +1,122 @@
++import test from 'node:test';
++import assert from 'node:assert/strict';
++import { webcrypto, createHash } from 'node:crypto';
++import { readFileSync } from 'node:fs';
++import {
++  MAGIC,
++  MAX_TENDIES_BYTES,
++  buildHeader,
++  encryptTendies,
++  outputFilename,
++  validateTendiesFile,
++} from '../dist/crypto.mjs';
++
++const fixture = JSON.parse(readFileSync(new URL('./interop-v1.json', import.meta.url), 'utf8'));
++const fromBase64 = value => new Uint8Array(Buffer.from(value, 'base64'));
++const plaintext = fromBase64(fixture.plaintext_base64);
++const fixedOptions = () => ({
++  packageId: fixture.package_id,
++  keyBytes: fromBase64(fixture.key_base64),
++  nonce: fromBase64(fixture.nonce_base64),
++});
++
++async function decryptEnvelope(encrypted, keyBytes = fromBase64(fixture.key_base64)) {
++  const key = await webcrypto.subtle.importKey('raw', keyBytes, { name: 'AES-GCM' }, false, ['decrypt']);
++  return new Uint8Array(await webcrypto.subtle.decrypt({
++    name: 'AES-GCM',
++    iv: encrypted.subarray(24, 36),
++    additionalData: encrypted.subarray(0, 24),
++    tagLength: 128,
++  }, key, encrypted.subarray(36)));
++}
++
++test('header carries the exact magic and RFC 4122 UUID bytes', () => {
++  assert.equal(MAGIC, 'DYNORT01');
++  const header = buildHeader(fixture.package_id);
++  assert.equal(header.byteLength, 24);
++  assert.equal(Buffer.from(header).toString('hex'), fixture.header_hex);
++  assert.deepEqual(buildHeader(fixture.package_id.toUpperCase()), header);
++  for (const invalid of ['', 'abc', '../01234567-89ab-4cde-8fab-0123456789ab', '0123456789ab4cde8fab0123456789ab', 'g1234567-89ab-4cde-8fab-0123456789ab']) {
++    assert.throws(() => buildHeader(invalid));
++  }
++});
++
++test('file selection accepts only nonempty .tendies files within the configured limit', () => {
++  assert.equal(MAX_TENDIES_BYTES, 50 * 1024 * 1024);
++  assert.doesNotThrow(() => validateTendiesFile({ name: 'Batman.TENDIES', size: plaintext.length }));
++  assert.doesNotThrow(() => validateTendiesFile({ name: 'Đồi cát.tendies', size: MAX_TENDIES_BYTES }));
++  for (const file of [
++    { name: 'Batman.zip', size: 100 },
++    { name: 'Batman.tendies.exe', size: 100 },
++    { name: 'Batman.tendies', size: 0 },
++    { name: 'Batman.tendies', size: MAX_TENDIES_BYTES + 1 },
++    { name: '.tendies', size: 100 },
++    { name: ' Batman.tendies', size: 100 },
++    { name: '../Batman.tendies', size: 100 },
++    { name: 'folder\\Batman.tendies', size: 100 },
++    { name: 'Batman\n.tendies', size: 100 },
++  ]) {
++    assert.throws(() => validateTendiesFile(file));
++  }
++});
++
++test('encrypted bytes match an independently generated OpenSSL AES-256-GCM vector', async () => {
++  const result = await encryptTendies(plaintext, fixedOptions());
++  assert.equal(result.packageId, fixture.package_id);
++  assert.equal(result.bytes.length, plaintext.length + 52);
++  assert.equal(Buffer.from(result.bytes).toString('base64'), fixture.encrypted_base64);
++  assert.equal(result.sha256, fixture.sha256);
++  assert.equal(result.sha256, createHash('sha256').update(result.bytes).digest('hex'));
++  assert.deepEqual(await decryptEnvelope(result.bytes), plaintext);
++});
++
++test('changing the package identifier, nonce, ciphertext, or tag fails authentication', async () => {
++  const { bytes } = await encryptTendies(plaintext, fixedOptions());
++  // Includes AAD, nonce, encrypted payload, and authentication tag.
++  for (const position of [8, 24, 36, bytes.length - 1]) {
++    const tampered = Uint8Array.from(bytes);
++    tampered[position] ^= 0x01;
++    await assert.rejects(() => decryptEnvelope(tampered));
++  }
++});
++
++test('a different content key cannot decrypt a package', async () => {
++  const { bytes } = await encryptTendies(plaintext, fixedOptions());
++  const wrongKey = fromBase64(fixture.key_base64);
++  wrongKey[0] ^= 1;
++  await assert.rejects(() => decryptEnvelope(bytes, wrongKey));
++});
++
++test('ordinary encryption creates independent package IDs, nonces, and content keys', async () => {
++  const first = await encryptTendies(plaintext);
++  const second = await encryptTendies(plaintext);
++  assert.notEqual(first.packageId, second.packageId);
++  assert.match(first.packageId, /^[a-f0-9]{8}-[a-f0-9]{4}-4[a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/);
++  assert.notDeepEqual(first.bytes.subarray(24, 36), second.bytes.subarray(24, 36));
++  assert.notDeepEqual(first.keyBytes, second.keyBytes);
++  assert.equal(first.keyBytes.length, 32);
++  assert.deepEqual(await decryptEnvelope(first.bytes, first.keyBytes), plaintext);
++  assert.deepEqual(await decryptEnvelope(second.bytes, second.keyBytes), plaintext);
++});
++
++test('invalid content and excessive input sizes fail before encryption', async () => {
++  for (const invalid of [new Uint8Array(), new Uint8Array([0x50, 0x4b, 0x03]), new TextEncoder().encode('not a ZIP archive')]) {
++    await assert.rejects(() => encryptTendies(invalid));
++  }
++  const excessive = new Uint8Array(MAX_TENDIES_BYTES + 1);
++  excessive.set([0x50, 0x4b, 0x03, 0x04]);
++  await assert.rejects(() => encryptTendies(excessive));
++});
++
++test('both local-header and empty-archive ZIP signatures can be encrypted', async () => {
++  for (const prefix of [[0x50, 0x4b, 0x03, 0x04], [0x50, 0x4b, 0x05, 0x06]]) {
++    const body = Uint8Array.from([...prefix, 0, 0, 0, 0]);
++    const result = await encryptTendies(body, fixedOptions());
++    assert.deepEqual(await decryptEnvelope(result.bytes), body);
++  }
++});
++
++test('encrypted downloads have .dynor names without changing the original stem', () => {
++  assert.equal(outputFilename('Batman.TENDIES'), 'Batman.dynor');
++  assert.equal(outputFilename('Đồi cát.tendies'), 'Đồi cát.dynor');
++});
+--- /dev/null
++++ b/Dynor-iOS/Tools/DynorVault/tests/fixture-plaintext.base64
+@@ -0,0 +1 @@
++UEsDBBQAAAAAAAAAIVxJhs0EHgAAAB4AAAALAAAAZml4dHVyZS50eHREeW5vciBUZW5kaWVzIGludGVyb3AgZml4dHVyZQpQSwECFAMUAAAAAAAAACFcSYbNBB4AAAAeAAAACwAAAAAAAAAAAAAAgAEAAAAAZml4dHVyZS50eHRQSwUGAAAAAAEAAQA5AAAARwAAAAAA
+--- /dev/null
++++ b/Dynor-iOS/Tools/DynorVault/tests/generate-interop.mjs
+@@ -0,0 +1,26 @@
++// Deterministic TEST ONLY material. This is never used by the web app.
++import { createCipheriv, createHash } from 'node:crypto';
++import { readFileSync, writeFileSync } from 'node:fs';
++
++const packageId = '01234567-89ab-4cde-8fab-0123456789ab';
++const key = Buffer.from(Array.from({ length: 32 }, (_, i) => i));
++const nonce = Buffer.from(Array.from({ length: 12 }, (_, i) => 0xa0 + i));
++const header = Buffer.concat([Buffer.from('DYNORT01', 'ascii'), Buffer.from(packageId.replaceAll('-', ''), 'hex')]);
++const plaintext = Buffer.from(readFileSync(new URL('./fixture-plaintext.base64', import.meta.url), 'utf8').trim(), 'base64');
++const cipher = createCipheriv('aes-256-gcm', key, nonce);
++cipher.setAAD(header);
++const ciphertext = Buffer.concat([cipher.update(plaintext), cipher.final()]);
++const encrypted = Buffer.concat([header, nonce, ciphertext, cipher.getAuthTag()]);
++const fixture = {
++  purpose: 'TEST ONLY: publicly known deterministic interop vector; never use this key or nonce in production',
++  format: 'Dynor encrypted Tendies v1',
++  package_id: packageId,
++  key_base64: key.toString('base64'),
++  nonce_base64: nonce.toString('base64'),
++  header_hex: header.toString('hex'),
++  plaintext_base64: plaintext.toString('base64'),
++  encrypted_base64: encrypted.toString('base64'),
++  sha256: createHash('sha256').update(encrypted).digest('hex'),
++};
++writeFileSync(new URL('./interop-v1.json', import.meta.url), `${JSON.stringify(fixture, null, 2)}\n`);
++console.log('Wrote independent OpenSSL AES-GCM interop fixture.');
+--- /dev/null
++++ b/Dynor-iOS/Tools/DynorVault/tests/interop-v1.json
+@@ -0,0 +1,11 @@
++{
++  "purpose": "TEST ONLY: publicly known deterministic interop vector; never use this key or nonce in production",
++  "format": "Dynor encrypted Tendies v1",
++  "package_id": "01234567-89ab-4cde-8fab-0123456789ab",
++  "key_base64": "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=",
++  "nonce_base64": "oKGio6Slpqeoqaqr",
++  "header_hex": "44594e4f525430310123456789ab4cde8fab0123456789ab",
++  "plaintext_base64": "UEsDBBQAAAAAAAAAIVxJhs0EHgAAAB4AAAALAAAAZml4dHVyZS50eHREeW5vciBUZW5kaWVzIGludGVyb3AgZml4dHVyZQpQSwECFAMUAAAAAAAAACFcSYbNBB4AAAAeAAAACwAAAAAAAAAAAAAAgAEAAAAAZml4dHVyZS50eHRQSwUGAAAAAAEAAQA5AAAARwAAAAAA",
++  "encrypted_base64": "RFlOT1JUMDEBI0VniatM3o+rASNFZ4mroKGio6SlpqeoqaqrtlN/KVHLAr9iZYfTJiaJWL2oRxCSt1xsnA4thn+rE2iqAjKNygwnRSvYfaZmCKOtInUiIQejOhcvKm4sywCl1t3E8RpCwO6wv+P9DIzazLrNC6ukxeDFM2i4OoSxmk2Kj4QroAOuj5ue2wZQhYjtqCVQYa7eU/JEW7qswZohijmVWrV500KAFzZZ/4srSpHWz9mta77QpSTOvX8mPa0JPRa160woZw==",
++  "sha256": "b343a42fdd55d7b175caeef9b0485db8ca992954df4626c0d0f533ac3a202844"
++}
+--- a/Dynor-iOS/VERIFICATION.md
++++ b/Dynor-iOS/VERIFICATION.md
+@@ -45,7 +45,8 @@
+ Các luồng cần kiểm tra cùng phiên bản đích:
+ 
+ - Nhập `.tendies` từ Tệp local và iCloud chưa tải; tên có chữ hoa trong extension; nhà cung cấp tài liệu khác nhau. Thử khi có/không cài AirCard cùng máy: tệp phải chọn được, “Chia sẻ → Dynor” xuất hiện. Hủy hoặc vuốt đóng picker rồi mở lại; nhập một/nhiều tệp và kiểm tra chuyển sheet sang màn hình xem trước.
+-- Từ Khám phá, tải `.tendies` và ảnh qua **Tải và mở trong Dynor**: thêm vào Thư viện và mở ngay màn hình xem trước. Định dạng khác vẫn mở bảng chia sẻ. Kiểm tra đăng nhập/VIP theo quyền nội dung hiện có.
++- Từ Khám phá, tải `.tendies` và ảnh qua **Tải và mở trong Dynor**: thêm vào Thư viện và mở ngay màn hình xem trước. Định dạng khác phải báo không hỗ trợ, không mở bảng chia sẻ và được dọn khỏi thư mục tải tạm. Kiểm tra đăng nhập/VIP theo quyền nội dung hiện có.
++- Mở gói Tendies từ Thư viện hoặc Khám phá: không có nút chia sẻ/xuất gói, vẫn có thể cài hình nền. Mở ảnh: vẫn lưu vào Photos và chia sẻ ảnh gốc được.
+ - Import `pairingFile.plist` và `rp_pairing_file.plist` thật; đóng/mở lại Dynor và kiểm tra bản sao còn dùng được, file gốc giữ nguyên. Trên iOS 27, thử ghép nối PIN thành công, hủy, từ chối quyền Mạng cục bộ và thử lại.
+ - Bật LocalDevVPN và mở khóa máy: tìm PosterBoard container, ghi các descriptor Collections/Mercury theo tên cũ/mới, cập nhật preferences, chọn wallpaper trong Màn hình khóa. Thử Wi-Fi bật/tắt và cấu hình VPN tương thích. Ngắt VPN hoặc dùng pairing sai phải báo lỗi.
+ - Kiểm tra gói full container, descriptor đơn, suggestion metadata và identifier ký hiệu. Gói hỏng hoặc không có descriptor phải bị từ chối trước khi ghi.
+@@ -59,3 +60,11 @@
+ - `project.yml` giữ `options.preGenCommand: python3 scripts/prepare_airlift.py --source-root .`. XcodeGen sẽ tải framework đã ghim và xác minh 7 SHA-256 khi source chưa có `Frameworks/`; nếu đã đủ bộ đúng hash thì bỏ qua tải lại.
+ - Gói tải nhẹ có thể bỏ `Frameworks/`; không bỏ `scripts/prepare_airlift.py` hoặc `ThirdParty/AirCard/provenance.json`. Cần mạng khi build lần đầu mà chưa có framework.
+ - Kiểm tra tải/xác minh framework không thay thế XcodeGen, archive bằng Xcode hoặc thử trên thiết bị. Cần chạy lại GitHub Actions/Codemagic với source 1.2.1 để xác nhận IPA và cài bản mới để kiểm tra lỗi nhập tệp.
++# Kiểm chứng gói mã hóa Dynor — 2026-11-16
++
++- 12 kiểm thử Node backend đạt, gồm xác thực/admin/VIP, quota, trạng thái thu hồi, hash, giới hạn request và liên thông mã hóa trình duyệt → đăng ký → cấp khóa → giải mã bằng Node/OpenSSL độc lập.
++- 9 kiểm thử crypto trình duyệt đạt, gồm vector AES-GCM độc lập, sửa header/nonce/ciphertext/tag, khóa sai, giới hạn dung lượng, UUID/nonce/khóa mới và tên file.
++- 26 tệp Swift phân tích cú pháp không có lỗi; YAML dự án hợp lệ. Đây không phải Swift typecheck hoặc build. 8 XCTest mới kiểm tra envelope, wrapper, dữ liệu bị sửa và tương thích model cũ; chưa thực thi do không có Xcode.
++- Bản mã `.dynor` nằm trong Thư viện; đường chia sẻ tệp chỉ dành cho ảnh. Bản rõ chỉ ở vùng cài tạm có bảo vệ; `defer` dọn sau thành công/lỗi và app dọn lại staging cũ lúc mở. Cần xác nhận trên iPhone cả nhánh thành công, lỗi, force-quit và khóa/mở khóa thiết bị.
++- Cần triển khai [ENCRYPTED_TENDIES_SETUP.md](ENCRYPTED_TENDIES_SETUP.md), chạy pipeline macOS và thử đăng nhập/quyền VIP, nhập qua Tệp/Khám phá, cài wallpaper thật. Chưa xác nhận luồng production hoặc thiết bị; hai endpoint mới hiện chưa được triển khai.
++
+--- a/Dynor-iOS/WALLPAPER_ONLINE_SETUP.md
++++ b/Dynor-iOS/WALLPAPER_ONLINE_SETUP.md
+@@ -27,7 +27,7 @@
+ 2. Cài bản IPA mới **một lần** để nhận tính năng Online Gallery.
+ 3. Từ đó, đăng bài mới trên Dynor Studio không cần build lại IPA; app cập nhật khi mở tab hoặc kéo xuống.
+ 4. Thả tim yêu cầu đăng nhập; yêu thích lưu trong `dynor_favorites` theo `user_id`.
+-5. Nút **Tải và mở trong Dynor** gọi Edge Function để xác minh phiên đăng nhập, trạng thái published và VIP rồi mới cấp URL riêng có hiệu lực 60 giây. Ảnh và `.tendies` tự thêm vào Thư viện rồi mở màn hình xem trước trong Dynor; các định dạng khác mở Share Sheet để lưu/chia sẻ.
++5. Nút **Tải và mở trong Dynor** gọi Edge Function để xác minh phiên đăng nhập, trạng thái published và VIP rồi mới cấp URL riêng có hiệu lực 60 giây. Ảnh và `.tendies` tự thêm vào Thư viện rồi mở màn hình xem trước trong Dynor; các định dạng khác báo không hỗ trợ và được dọn khỏi thư mục tải tạm. App không xuất hoặc chia sẻ gói Tendies.
+ 6. Với `.tendies`, chọn **Cài hình nền** ngay trong màn hình vừa mở. Cần pairing của thiết bị và LocalDevVPN đang hoạt động; iOS 18–26 nhập file pairing, iOS 27 có thêm ghép nối trong Cài đặt. Sau khi cài, nhấn giữ màn hình khóa → Thêm hình nền để chọn mẫu mới. Xem phạm vi phiên bản và hướng dẫn chi tiết trong `README.md`.
+ 
+ ## Lưu ý
+@@ -36,3 +36,4 @@
+ - Video MP4 cần định dạng được AVPlayer trên iOS hỗ trợ (nên dùng H.264/AAC).
+ - Supabase Storage giới hạn kích thước tùy gói/cấu hình; nếu upload thất bại do giới hạn, cần điều chỉnh cấu hình hoặc tối ưu file.
+ - Nếu dùng nội dung VIP trả phí trên App Store, cần kiểm tra quy định thanh toán Apple trước khi phát hành.
++- Với gói mã hóa `.dynor`, triển khai thêm SQL và hai Edge Function theo [ENCRYPTED_TENDIES_SETUP.md](ENCRYPTED_TENDIES_SETUP.md), rồi upload `.dynor` làm file tải về. Quyền VIP của gói và bài Gallery độc lập; muốn bảo vệ nội dung VIP phải bật cả hai.
+--- a/Dynor-iOS/project.yml
++++ b/Dynor-iOS/project.yml
+@@ -70,7 +70,14 @@
+         UIBackgroundModes:
+           - audio
+         LSSupportsOpeningDocumentsInPlace: true
++        UIFileSharingEnabled: false
+         UTExportedTypeDeclarations:
++          - UTTypeIdentifier: com.dynor.encrypted-tendies
++            UTTypeDescription: Dynor encrypted wallpaper
++            UTTypeConformsTo:
++              - public.data
++            UTTypeTagSpecification:
++              public.filename-extension: dynor
+           - UTTypeIdentifier: com.dynor.tendies
+             UTTypeDescription: Tendies wallpaper
+             UTTypeConformsTo:
+@@ -98,6 +105,11 @@
+                 - mobiledevicepairing
+                 - mobilepair
+         CFBundleDocumentTypes:
++          - CFBundleTypeName: Dynor encrypted wallpaper
++            CFBundleTypeRole: Viewer
++            LSHandlerRank: Alternate
++            LSItemContentTypes:
++              - com.dynor.encrypted-tendies
+           - CFBundleTypeName: Tendies wallpaper
+             CFBundleTypeRole: Viewer
+             LSHandlerRank: Alternate
