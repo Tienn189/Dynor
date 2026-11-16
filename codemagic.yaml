@@ -201,7 +201,24 @@ workflows:
         shutil.copyfile(artifacts / "README-IPA.txt", downloads / "README-IPA.txt")
         print(f"Download ZIP containing the unsigned IPA: {wrapper}")
         PYCODE
+    - name: Ký IPA và xác minh App Group (nếu cấu hình đủ chứng chỉ)
+      script: |
+        set -euo pipefail
+        if [ -z "${DYNOR_CERTIFICATE_P12_BASE64:-}" ] && [ -z "${DYNOR_CERTIFICATE_PASSWORD:-}" ] && [ -z "${DYNOR_PROVISION_PROFILE_BASE64:-}" ]; then
+          echo "Không có chứng chỉ Apple: chỉ xuất IPA unsigned."
+          exit 0
+        fi
+        for variable in DYNOR_CERTIFICATE_P12_BASE64 DYNOR_CERTIFICATE_PASSWORD DYNOR_PROVISION_PROFILE_BASE64; do
+          if [ -z "${!variable:-}" ]; then
+            echo "Thiếu $variable; không thể ký IPA." >&2
+            exit 1
+          fi
+        done
+        python3 "$SOURCE_DIR/scripts/sign_ipa.py" \
+          --input "$CM_BUILD_DIR/build/ipa/Dynor-unsigned.ipa" \
+          --output "$CM_BUILD_DIR/build/download/Dynor-signed.ipa"
     artifacts:
+    - build/download/Dynor-signed.ipa
     - build/download/Dynor-IPA.zip
     - build/download/README-IPA.txt
     - build/logs/*.log
