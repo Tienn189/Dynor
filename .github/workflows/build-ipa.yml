@@ -7,7 +7,7 @@ on:
       source_zip:
         description: 'ZIP source filename in repository'
         required: true
-        default: 'Dynor-File1-Layout-File2-BuildFix74.zip'
+        default: 'Dynor-IOS-source.zip'
         type: string
 
 permissions:
